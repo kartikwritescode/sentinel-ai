@@ -60,3 +60,8 @@ class VideoSource:
 # enter() -> Runs before the code inside with.
 # exit() -> Runs after leaving the block
 # to prevent resource leak (keeping the file open)
+
+
+
+
+# __iter__ with yield -> instead of loading all frames at the same time , the yields gives u one frame at a time
