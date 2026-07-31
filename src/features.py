@@ -26,6 +26,9 @@ class FeatureEngineer:
         # previous frame (for optical flow)
         self._prev_gray = None 
 
+        # defaultdict(lambda: deque(maxlen=window_size)): A dictionary that auto-creates a deque when you access a new key. The maxlen on the deque means old frames automatically fall off the end -> you always have exactly the last N frames, no manual trimming.
+        
+
     def update(self,frame,persons_with_poses):
         """
         Call this every frame. Updates internal history.
@@ -187,3 +190,8 @@ class FeatureEngineer:
         self.pose_history.clear()
         self.bbox_history.clear()
         self._prev_gray = None
+
+
+
+
+
