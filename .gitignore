@@ -3,3 +3,4 @@ data
 notebooks/features.npy
 notebooks/labels.npy
 __pycache__
+cctv.md
