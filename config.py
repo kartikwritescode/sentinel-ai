@@ -1,0 +1,5 @@
+SEQUENCE_LENGTH = 16
+IMAGE_HEIGHT , IMAGE_WIDTH = 64,64
+# CLASSES_LIST = ['NonViolence','Violence']
+CLASSES_LIST = ['NonFight','Fight']
+
