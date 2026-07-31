@@ -2,4 +2,4 @@
 data
 notebooks/features.npy
 notebooks/labels.npy
-notebooks/video_files_paths.npy
+__pycache__
