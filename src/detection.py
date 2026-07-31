@@ -20,8 +20,22 @@ class PersonDetector:
         self.classes = YOLO(config.YOLO_CLASSES)
 
     def detect_and_track(self,frame):
-
-
+        """
+        Args:
+            frame: np.ndarray -> one BGR image from your video source
+        
+        Returns:
+            list of dicts, one per detected person:
+            [
+                {
+                    "track_id": 1,          # stable ID from ByteTrack
+                    "bbox": [x1, y1, x2, y2],  # pixel coordinates
+                    "confidence": 0.87,
+                    "crop": np.ndarray      # the cropped person image for pose
+                },
+                ...
+            ]
+        """
 
 
         results = self.model.track(
