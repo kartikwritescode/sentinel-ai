@@ -1,107 +1,60 @@
-from fastapi import FastAPI, UploadFile , File
-from fastapi.responses import JSONResponse
-import shutil
-import numpy as np
-import cv2
-import os
-from tensorflow.keras.models import load_model
-from collections import deque
-import config
+from src.video_source import VideoSource
+from src.detection    import PersonDetector
+from src.pose         import PoseEstimator
+from src.features     import FeatureEngineer
+from src.classifier   import Tier2Inferencer
+from src.alerting     import EventLogger, EvidenceClipWriter, AlertDebouncer, send_telegram_alert
 
-app = FastAPI(title='Violence Detection API')
+def run_pipeline(video_source_arg):
+    detector = PersonDetector()
+    estimator = PoseEstimator()
+    engineer = FeatureEngineer()
+    inferencer = Tier2Inferencer()
+    debouncer = AlertDebouncer()
+    logger = EventLogger()
+    clip_writer = EvidenceClipWriter()
 
-UPLOAD_DIR = 'uploads'
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# loadong the model
-MODEL_PATH = 'model/MoBiLSTM_model.h5'
-MoBiLSTM_model = load_model(MODEL_PATH)
-
-print("=" * 60)
-print("Model Loaded Successfully")
-print("Input Shape :", MoBiLSTM_model.input_shape)
-print("Output Shape:", MoBiLSTM_model.output_shape)
-print("=" * 60)
-
-
-# Frame extraction Function
-def extract_frames(video_path , sequence_length=config.SEQUENCE_LENGTH):
-    frames_list =[]
-    video_reader = cv2.VideoCapture(video_path)
-    video_frames_count = int(video_reader.get(cv2.CAP_PROP_FRAME_COUNT))
-    skip_frames_window = max(video_frames_count // sequence_length, 1)
-
-    for frame_counter in range(sequence_length):
-        video_reader.set(cv2.CAP_PROP_POS_FRAMES,frame_counter * skip_frames_window)
-        success , frame = video_reader.read()
-
-        if not success:
-            break
-        resized_frame = cv2.resize(frame,(config.IMAGE_WIDTH,config.IMAGE_HEIGHT))  
-        normalized_frame = resized_frame / 255.0
-        frames_list.append(normalized_frame)
-
-    video_reader.release()
-    return np.array(frames_list)
-
-
-
-
-# Prediction Function
-
-def predict_video_class(video_path):
-    frames = extract_frames(video_path)
-    if len(frames) != config.SEQUENCE_LENGTH:
-        return {'error':f'Video has insufficient frames ({len(frames)}). Minimum required: {config.SEQUENCE_LENGTH}'}
-
-    frames_expanded = np.expand_dims(frames,axis=0)
-    predictions = MoBiLSTM_model.predict(frames_expanded,verbose=0)[0]
-    predicted_label_index = np.argmax(predictions)
-    predicted_class = config.CLASSES_LIST[predicted_label_index]
-    confidence = float(predictions[predicted_label_index])
-
-    return {
-        "prediction": predicted_class,
-        "confidence": confidence
-    }
-
-
-#Routes
-
-@app.get('/')
-def home():
-    return {'message':'Violence Detection API Running'}
-
-
-@app.post('/predict')
-async def predict(file:UploadFile=File(...)):
-    try:
-        filepath = os.path.join(UPLOAD_DIR,file.filename)
-        with open(filepath,'wb') as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        result = predict_video_class(filepath)
-        os.remove(filepath)
-
-        return JSONResponse(result)
-    except Exception as e:
-        return JSONResponse(
-            {
-                'error':str(e)
-            },
-            status_code=500 
-        )
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "running",
-        "model_loaded": True,
-        "input_shape": str(MoBiLSTM_model.input_shape),
-        "output_shape": str(MoBiLSTM_model.output_shape)
-    }
-
-
-if __name__ == "__main__":
-    print("App imported successfully")
+    with VideoSource(video_source_arg) as source:
+        fps = source.get_fps()
+        clip_writer.fps = fps
+        
+        for frame in source:
+            # 1. Detect people
+            persons = detector.detect_and_track(frame)
+            
+            # 2. Estimate pose for each person
+            for person in persons:
+                person["keypoints"] = estimator.extract_keypoints(person["crop"])
+            
+            # 3. Compute features
+            feature_vec = engineer.update(frame, persons)
+            
+            # 4. Always maintain the clip buffer (pre-event footage)
+            clip_writer.push_frame(frame)
+            
+            if feature_vec is None:
+                continue
+            
+            # 5. Run the classifier
+            confidence = inferencer.push_features(feature_vec)
+            
+            if confidence is None:
+                continue
+            
+            # 6. Debounce and fire alert
+            should_alert = debouncer.update(confidence)
+            
+            if should_alert:
+                clip_path = clip_writer.trigger_save()
+                timestamp = logger.log_event(
+                    confidence=confidence,
+                    clip_path=clip_path,
+                    source_id=str(video_source_arg),
+                    person_count=len(persons)
+                )
+                send_telegram_alert(
+                    f"⚠️ Suspicious activity detected!\n"
+                    f"Time: {timestamp}\n"
+                    f"Confidence: {confidence:.1%}\n"
+                    f"Persons: {len(persons)}"
+                )
