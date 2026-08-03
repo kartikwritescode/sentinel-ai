@@ -4,3 +4,6 @@ notebooks/features.npy
 notebooks/labels.npy
 __pycache__
 cctv.md
+yolo11n-pose.pt
+yolo11n.pt
+tier2_gru.pt
