@@ -13,7 +13,7 @@ class EventLogger:
     Logs detected incidents to a SQLite database.
     
     SQLite is a file-based database — no server, no setup, just a .db file.
-    It's built into Python's standard library (no pip install needed).
+    It's built into Python's standard library.
     """
     def __init__(self,db_path = config.SQLITE_DB_PATH):
         os.makedirs(os.path.dirname(db_path),exist_ok=True)
@@ -31,21 +31,22 @@ class EventLogger:
                 source_id   TEXT,
                 person_count INTEGER
             )
-        """)self.conn.commit()
+        """)
+        self.conn.commit()  
 
     def log_event(self,confidence,clip_path=None,source_id = 'unknown',person_count=0):
         timestamp = datetime.datetime.now().isoformat()
         self.conn.execute(
             "INSERT INTO events(timestamp , confidence , clip_path, source_id, person_count) "
             "VALUES(?,?,?,?,?)",
-            (time,confidence,clip_path,source_id,person_count)
+            (timestamp, confidence, clip_path, source_id, person_count)  # was 'time', fixed to 'timestamp'
         )
         self.conn.commit()
         return timestamp
 
     def get_recent_events(self,limit=50):
         cursor = self.conn.execute(
-            "SELECT * FROOM events ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)  # was FROOM, fixed
         )
         return cursor.fetchall()
     def close(self):
@@ -127,7 +128,7 @@ class AlertDebouncer:
     def update(self, confidence):
         """
         Args:
-            confidence: float — model's output (0.0 to 1.0)
+            confidence: float -> model's output (0.0 to 1.0)
         
         Returns:
             True if an alert should fire, False otherwise

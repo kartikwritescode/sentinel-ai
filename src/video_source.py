@@ -13,13 +13,13 @@ class VideoSource:
         source = VideoSource("path/to/clip.mp4")         # uploaded file
         
         with source:
-            for frame in source:
+            for frame in source: 
                 # frame is a numpy array (H, W, 3) in BGR format
                 process(frame)
     """
-    def __init__(self,source):
+    def __init__(self, source):
         self.source = source
-        self.cap = None
+        self._cap = None   # was self.cap — inconsistent with self._cap used in all other methods
 
     def open(self):
         self._cap = cv2.VideoCapture(self.source)

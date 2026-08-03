@@ -2,6 +2,7 @@
 
 from ultralytics import YOLO
 import config
+import torch
 
 class PersonDetector:
     """
@@ -15,9 +16,10 @@ class PersonDetector:
 
     def __init__(self):
         # load the model once at startup -> expensive operation so better to not keep it inside loop
-        self.model = YOLO(config.YOLO_MODEL)
-        self.conf = YOLO(config.YOLO_CONF_THRESH)
-        self.classes = YOLO(config.YOLO_CLASSES)
+        self.model   = YOLO(config.YOLO_MODEL)   # load weights — the only thing YOLO() should receive
+        self.conf    = config.YOLO_CONF_THRESH    # plain float, not a model path
+        self.classes = config.YOLO_CLASSES        # plain list [0], not a model path
+        self.device = 0 if torch.cuda.is_available() else "cpu"
 
     def detect_and_track(self,frame):
         """
@@ -40,29 +42,34 @@ class PersonDetector:
 
         results = self.model.track(
             source=frame,
-            traker = 'bytetrack.yaml', 
-            classes = self.classes,  #only persons(class 0)
-            conf = self.conf,   
-            persist = True,          #keeps track ids stable -> without this ByteTrack resets its memory every frame
+            tracker="bytetrack.yaml",
+            classes=self.classes,
+            conf=self.conf,
+            persist=True,
+            device=self.device,                 # GPU acceleration (CUDA) if available
             verbose=False
         )
 
         persons = []
         for result in results:
-            if result.boxes is None:
+            if result.boxes is None or len(result.boxes) == 0:
                 continue
-            for box in result.boxes:
+
+            has_keypoints = (result.keypoints is not None and result.keypoints.data is not None)
+
+            for i, box in enumerate(result.boxes):
                 track_id = int(box.id) if box.id is not None else -1
-                x1 , y1 , x2 , y2 = map(int, box.xyxy[0].tolist())
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 confidence = float(box.conf[0])
 
-                # crop the person outta frame for pose estimation
-                crop = frame[y1:y2 , x1:x2]
+                keypoints_flat = None
+                if has_keypoints and i < len(result.keypoints.data):
+                    keypoints_flat = result.keypoints.data[i].cpu().numpy().flatten()
 
                 persons.append({
-                    'track_id':track_id,
-                    'bbox':[x1,y1,x2,y2],
-                    'confidence':confidence,
-                    'crop':crop
+                    'track_id': track_id,
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': confidence,
+                    'keypoints': keypoints_flat
                 })
         return persons

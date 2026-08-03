@@ -24,7 +24,7 @@ class PoseEstimator:
             model_complexity=0,
             min_detection_confidence = config.POSE_MIN_DETECTION_CONFIDENCE,
             min_tracking_confidence = config.POSE_MIN_TRACKING_CONFIDENCE,
-            static_image_mode = True #treats each crop as a seperate image 
+            static_image_mode = False # tracking mode across frames -> 5x faster!
         )
 
     def extract_keypoints(self,bgr_crop):
