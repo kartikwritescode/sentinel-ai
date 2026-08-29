@@ -31,7 +31,7 @@ from src.video_source import VideoSource
 from src.detection    import PersonDetector
 from src.features     import FeatureEngineer
 from src.classifier   import Tier2Inferencer
-from src.alerting     import EventLogger, EvidenceClipWriter, AlertDebouncer, send_telegram_alert
+from src.alerting     import EventLogger, EvidenceClipWriter, AlertDebouncer, send_telegram_alert, format_alert_message
 from app import draw_visual_overlays
 
 app = FastAPI(
@@ -143,12 +143,20 @@ def generate_mjpeg_stream(video_source_arg: str):
                             source_id=str(source_val),
                             person_count=len(persons)
                         )
-                        send_telegram_alert(
-                            f"⚠️ Suspicious activity detected!\n"
-                            f"Time: {timestamp}\n"
-                            f"Confidence: {latest_confidence:.1%}\n"
-                            f"Persons: {len(persons)}"
+                        formatted_msg = format_alert_message(
+                            timestamp=timestamp,
+                            confidence=latest_confidence,
+                            source_id=str(source_val),
+                            person_count=len(persons)
                         )
+
+                        def make_send_callback(msg):
+                            def _callback(saved_video_path):
+                                send_telegram_alert(message=msg, video_path=saved_video_path)
+                            return _callback
+
+                        clip_writer.on_clip_complete = make_send_callback(formatted_msg)
+                        send_telegram_alert(message=formatted_msg)
 
             # 4. Render visual HUD overlays
             draw_visual_overlays(frame, persons, latest_confidence, is_alerting)

@@ -4,7 +4,7 @@ from src.video_source import VideoSource
 from src.detection    import PersonDetector
 from src.features     import FeatureEngineer
 from src.classifier   import Tier2Inferencer
-from src.alerting     import EventLogger, EvidenceClipWriter, AlertDebouncer, send_telegram_alert
+from src.alerting     import EventLogger, EvidenceClipWriter, AlertDebouncer, send_telegram_alert, format_alert_message
 
 # COCO 17 Keypoint Skeleton connection pairs
 SKELETON_CONNECTIONS = [
@@ -136,12 +136,24 @@ def run_pipeline(video_source_arg, display=True):
                             source_id=str(video_source_arg),
                             person_count=len(persons)
                         )
-                        send_telegram_alert(
-                            f"⚠️ Suspicious activity detected!\n"
-                            f"Time: {timestamp}\n"
-                            f"Confidence: {latest_confidence:.1%}\n"
-                            f"Persons: {len(persons)}"
+                        formatted_msg = format_alert_message(
+                            timestamp=timestamp,
+                            confidence=latest_confidence,
+                            source_id=str(video_source_arg),
+                            person_count=len(persons)
                         )
+
+                        # Set callback on clip_writer so when the video finishes writing to disk,
+                        # it dispatches the evidence video directly to Telegram
+                        def make_send_callback(msg):
+                            def _callback(saved_video_path):
+                                send_telegram_alert(message=msg, video_path=saved_video_path)
+                            return _callback
+
+                        clip_writer.on_clip_complete = make_send_callback(formatted_msg)
+
+                        # Send immediate text notification while video is recording
+                        send_telegram_alert(message=formatted_msg)
 
             # 6. Render visual overlays and display desktop window
             if display:

@@ -1,0 +1,18 @@
+# Docker build ignore file
+.git
+.gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+data/violence_fight_detection_dataset/
+data/raw/
+data/*.npy
+data/uploads/
+data/evidence_clips/*
+data/events.db
+.DS_Store
+.idea/
+.vscode/
