@@ -1,16 +1,7 @@
 """
 scripts/evaluate.py
 ───────────────────
-Evaluation script for the Tier 2 GRU Classifier.
-
-Loads pre-extracted feature arrays and trained model weights, then computes:
-- Accuracy, Precision, Recall (Sensitivity), Specificity, F1-Score, False Positive Rate (FPR)
-- Confusion Matrix (TP, FP, TN, FN)
-- Per-dataset accuracy breakdown (RLVS vs RWF-2000)
-- Average Inference Latency (ms per window & FPS)
-
-Run from project root:
-    py -3.10 scripts/evaluate.py
+Comprehensive Evaluation for Conv-BiGRU Temporal Attention Classifier.
 """
 
 import sys
@@ -26,7 +17,7 @@ import numpy as np
 from pathlib import Path
 
 import config
-from src.classifier import SuspiciousActivityGRU
+from src.classifier import SuspiciousActivityGRU, FeatureScaler, SCALER_PATH
 from scripts.train import stratified_split
 
 
@@ -49,39 +40,60 @@ def evaluate_model():
     sources = np.load(src_path, allow_pickle=True) if src_path.exists() else np.array(["unknown"] * len(X))
 
     # Perform stratified split (same split used in train.py)
-    _, _, _, _, X_test, y_test, src_test = stratified_split(
+    _, _, X_val, y_val, X_test, y_test, src_test = stratified_split(
         X, y, sources, train_ratio=0.80, val_ratio=0.10, seed=42
     )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Evaluating on device: {device}")
+    print(f"Evaluating on Device: {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
+
+    # Load FeatureScaler
+    scaler = FeatureScaler()
+    if not scaler.load(SCALER_PATH):
+        scaler.fit(X)
+
+    X_val_norm  = scaler.transform(X_val)
+    X_test_norm = scaler.transform(X_test)
 
     # Load model
     model = SuspiciousActivityGRU().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    # Measure inference latency
-    X_t = torch.FloatTensor(X_test).to(device)
-
-    # Warmup
+    # Latency benchmark
+    X_t = torch.FloatTensor(X_test_norm).to(device)
     with torch.no_grad():
-        _ = model(X_t[:10])
-
-    t0 = time.time()
-    with torch.no_grad():
+        _ = model(X_t[:10])  # Warmup
+        t0 = time.time()
         logits = model(X_t).squeeze(1)
         probs = logits.cpu().numpy()
-    total_time = time.time() - t0
+        total_time = time.time() - t0
 
     latency_ms = (total_time / len(X_test)) * 1000.0
     throughput_fps = len(X_test) / total_time
 
-    # Predictions
-    preds = (probs >= 0.5).astype(int)
+    # Find optimal threshold on validation set
+    with torch.no_grad():
+        val_probs = model(torch.FloatTensor(X_val_norm).to(device)).squeeze(1).cpu().numpy()
+
+    best_thresh = 0.50
+    best_f1 = 0.0
+    for t in np.linspace(0.35, 0.65, 31):
+        v_pred = (val_probs >= t).astype(int)
+        tp = np.sum((v_pred == 1) & (y_val == 1))
+        fp = np.sum((v_pred == 1) & (y_val == 0))
+        fn = np.sum((v_pred == 0) & (y_val == 1))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = float(t)
+
+    # Predictions on test set using optimal threshold
+    preds = (probs >= best_thresh).astype(int)
     targets = y_test.astype(int)
 
-    # Confusion matrix components
     tp = int(np.sum((preds == 1) & (targets == 1)))
     fp = int(np.sum((preds == 1) & (targets == 0)))
     tn = int(np.sum((preds == 0) & (targets == 0)))
@@ -113,6 +125,7 @@ def evaluate_model():
     metrics_report = {
         "device": str(device),
         "test_samples": total,
+        "calibrated_threshold": round(best_thresh, 2),
         "confusion_matrix": {
             "true_positives": tp,
             "false_positives": fp,
@@ -134,17 +147,15 @@ def evaluate_model():
         "per_dataset_accuracy": dataset_metrics
     }
 
-    # Save JSON report
     report_path = Path("data/eval_report.json")
     report_path.parent.mkdir(exist_ok=True)
     with open(report_path, "w") as f:
         json.dump(metrics_report, f, indent=4)
 
-    # Print summary
     print("\n=======================================================")
-    print("           MODEL EVALUATION METRICS REPORT             ")
+    print("      CONV-BIGRU ATTENTION MODEL EVALUATION REPORT     ")
     print("=======================================================")
-    print(f" Device              : {device}")
+    print(f" Calibrated Threshold: {best_thresh:.2f}")
     print(f" Test Set Size       : {total} clips")
     print(" -------------------------------------------------------")
     print(f" Accuracy            : {accuracy * 100.0:.2f}%")
@@ -172,3 +183,4 @@ def evaluate_model():
 
 if __name__ == "__main__":
     evaluate_model()
+

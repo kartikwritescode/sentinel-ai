@@ -1,196 +1,286 @@
-# math/engineering that turns poses into meaningful numbers that capture behaviour
-
-# Person A's right wrist velocity is 8.2 m/s, they are 0.3 body-widths apart from Person B, their bounding boxes overlap by 40%
-
-
+# Advanced 24-D Kinematic and Multi-Person Spatial Interaction Feature Engineering
 import numpy as np
 import cv2
 from collections import defaultdict, deque
+import torch
 import config
+
 
 class FeatureEngineer:
     """
-    Maintains a rolling history of detections per track_id and computes
-    a feature vector over the last FEATURE_WINDOW_FRAMES frames.
-    
-    This is a STATEFUL object -> it remembers what it saw in past frames.
-    You create ONE instance and call update() on every frame.
+    Stateful kinematic and spatial interaction feature extractor.
+    Extracts a 24-dimensional feature vector per frame capturing:
+      - Individual joint velocities (wrists, elbows, shoulders, legs, head)
+      - Upper-body acceleration / striking jerk
+      - Kinetic energy across the skeleton
+      - Bounding box aspect-ratio dynamics (fall / ground tackle detection)
+      - Cross-person pairwise proximity & IoU overlap
+      - Rapid approach rate (closing distance before strike)
+      - Extremity-to-vital-zone distances (wrists/feet to head/torso)
+      - Person-masked optical flow (immune to background motion)
+      - Active tracked person count
     """
-
-    def __init__(self, window_size = config.FEATURE_WINDOW_FRAMES):
+    def __init__(self, window_size=getattr(config, 'FEATURE_WINDOW_FRAMES', 30)):
         self.window_size = window_size
-        # per person history : track_id -> deque of keypoint arrays
-        self.pose_history = defaultdict(lambda:deque(maxlen=window_size))
-        # per person hisotry : track id -> deque of bounding boxes
-        self.bbox_history = defaultdict(lambda:deque(maxlen=window_size))
-        # previous frame (for optical flow)
-        self._prev_gray = None 
-
-        # defaultdict(lambda: deque(maxlen=window_size)): A dictionary that auto-creates a deque when you access a new key. The maxlen on the deque means old frames automatically fall off the end -> you always have exactly the last N frames, no manual trimming.
-        
-        import torch
+        self.pose_history = defaultdict(lambda: deque(maxlen=window_size))
+        self.bbox_history = defaultdict(lambda: deque(maxlen=window_size))
+        self.velocity_history = defaultdict(lambda: deque(maxlen=window_size))
+        self._prev_gray = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
 
-    def update(self,frame,persons_with_poses):
+    def update(self, frame, persons_with_poses):
         """
-        Call this every frame. Updates internal history.
-        
-        Args:
-            frame: current BGR frame (np.ndarray)
-            persons_with_poses: list of dicts:
-              [{"track_id": 1, "bbox": [...], "keypoints": np.ndarray or None}, ...]
-        
+        Processes the current frame and detected person poses.
         Returns:
-            feature_vector: np.ndarray — the computed features for THIS frame window
-                            Returns None if not enough history yet
+            np.ndarray (shape: (24,)) or None
         """
-
-        # store history for each tracked person
+        # 1. Update history for tracked individuals
+        current_tids = set()
         for person in persons_with_poses:
             tid = person['track_id']
-            if person['keypoints'] is not None:
+            current_tids.add(tid)
+            if person.get('keypoints') is not None and len(person['keypoints']) >= 51:
                 self.pose_history[tid].append(person['keypoints'])
             self.bbox_history[tid].append(person['bbox'])
 
-        # compute optical flow (global motion signal)
-        gray = cv2.cvtColor(frame , cv2.COLOR_BGR2GRAY)
-        flow_magnitude = self._compute_optical_flow(gray)
+        # Clean up stale track IDs that haven't been seen in window_size frames
+        all_tids = list(self.bbox_history.keys())
+        for tid in all_tids:
+            if tid not in current_tids and len(self.bbox_history[tid]) == 0:
+                self.pose_history.pop(tid, None)
+                self.bbox_history.pop(tid, None)
+                self.velocity_history.pop(tid, None)
+
+        # 2. Compute Person-Masked Optical Flow (foreground only)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        flow_mean, flow_peak = self._compute_person_masked_flow(gray, persons_with_poses)
         self._prev_gray = gray
 
-        # Compute per person features
-        person_features = []
-        track_ids = list(self.pose_history.keys())
+        # 3. Compute Per-Person Kinematic Features
+        wrist_vels, elbow_vels, shoulder_vels, leg_vels, head_vels = [], [], [], [], []
+        accels, kinetic_energies, aspect_ratio_changes = [], [], []
 
-        for tid in track_ids:
-            hist = list(self.pose_history[tid])
-            bbox_hist = list(self.bbox_history[tid])
+        for tid in current_tids:
+            p_hist = list(self.pose_history[tid])
+            b_hist = list(self.bbox_history[tid])
 
-            if len(hist) < 2: # need atleast 2 frames for velocity
-                continue
+            if len(p_hist) >= 2:
+                # Joint speeds & kinetic energy
+                w_v, e_v, s_v, l_v, h_v, k_e = self._compute_joint_dynamics(p_hist[-2], p_hist[-1])
+                wrist_vels.append(w_v)
+                elbow_vels.append(e_v)
+                shoulder_vels.append(s_v)
+                leg_vels.append(l_v)
+                head_vels.append(h_v)
+                kinetic_energies.append(k_e)
 
-            wrist_velocity = self._wrist_velocity(hist)   # was outside the loop — fixed
-            person_features.append(wrist_velocity)
+                # Track velocity for acceleration / jerk
+                self.velocity_history[tid].append(w_v)
+                if len(self.velocity_history[tid]) >= 2:
+                    accel = abs(self.velocity_history[tid][-1] - self.velocity_history[tid][-2])
+                    accels.append(accel)
 
-        # compute pairwise features (between every pair of people)
-        
-        pair_features = []
-        for i in range(len(track_ids)):
-            for j in range(i + 1, len(track_ids)):
-                tid_a, tid_b = track_ids[i], track_ids[j]
-                if tid_a in self.bbox_history and tid_b in self.bbox_history:
-                    dist   = self._person_distance(tid_a, tid_b)
-                    overlap = self._bbox_overlap(tid_a, tid_b)
-                    pair_features.extend([dist, overlap])
-        
-        # Assemble final feature vector
-        # Use mean/max aggregation so the vector is always the same size regardless of how many people are in the frame
-        features = []
-        features.append(np.mean(person_features) if person_features else 0.0)
-        features.append(np.max(person_features)  if person_features else 0.0)
-        features.append(np.mean(pair_features)   if pair_features   else 0.0)
-        features.append(np.max(pair_features)    if pair_features   else 0.0)
-        features.append(flow_magnitude)
-        features.append(len(track_ids))  # person count as a feature
-        
+            if len(b_hist) >= 2:
+                # Aspect ratio rate of change: (h/w)_curr - (h/w)_prev
+                ar_curr = (b_hist[-1][3] - b_hist[-1][1]) / max(b_hist[-1][2] - b_hist[-1][0], 1)
+                ar_prev = (b_hist[-2][3] - b_hist[-2][1]) / max(b_hist[-2][2] - b_hist[-2][0], 1)
+                aspect_ratio_changes.append(abs(ar_curr - ar_prev))
+
+        # 4. Compute Multi-Person Interaction & Striking Features
+        tid_list = list(current_tids)
+        pair_dists, pair_ious, pair_approaches, strike_dists = [], [], [], []
+
+        for i in range(len(tid_list)):
+            for j in range(i + 1, len(tid_list)):
+                ta, tb = tid_list[i], tid_list[j]
+                if ta in self.bbox_history and tb in self.bbox_history:
+                    # Normalized center distance & IoU
+                    d_curr, iou = self._bbox_interaction(ta, tb)
+                    pair_dists.append(d_curr)
+                    pair_ious.append(iou)
+
+                    # Approach velocity
+                    if len(self.bbox_history[ta]) >= 2 and len(self.bbox_history[tb]) >= 2:
+                        d_prev, _ = self._bbox_interaction_at_offset(ta, tb, -2)
+                        approach_speed = max(0.0, d_prev - d_curr)
+                        pair_approaches.append(approach_speed)
+
+                    # Extremity-to-vital zone distance (Person A arms/legs to Person B torso/head)
+                    if len(self.pose_history[ta]) > 0 and len(self.pose_history[tb]) > 0:
+                        s_dist = self._extremity_to_body_distance(
+                            self.pose_history[ta][-1], self.pose_history[tb][-1],
+                            self.bbox_history[ta][-1], self.bbox_history[tb][-1]
+                        )
+                        if s_dist is not None:
+                            strike_dists.append(s_dist)
+
+        # 5. Assemble 24-D Feature Vector
+        features = [
+            float(np.mean(wrist_vels)) if wrist_vels else 0.0,
+            float(np.max(wrist_vels))  if wrist_vels else 0.0,
+            float(np.mean(elbow_vels)) if elbow_vels else 0.0,
+            float(np.max(elbow_vels))  if elbow_vels else 0.0,
+            float(np.mean(shoulder_vels)) if shoulder_vels else 0.0,
+            float(np.max(shoulder_vels))  if shoulder_vels else 0.0,
+            float(np.mean(leg_vels)) if leg_vels else 0.0,
+            float(np.max(leg_vels))  if leg_vels else 0.0,
+            float(np.mean(head_vels)) if head_vels else 0.0,
+            float(np.max(head_vels))  if head_vels else 0.0,
+            float(np.max(accels)) if accels else 0.0,
+            float(np.mean(kinetic_energies)) if kinetic_energies else 0.0,
+            float(np.max(kinetic_energies))  if kinetic_energies else 0.0,
+            float(np.min(pair_dists)) if pair_dists else 0.0,
+            float(np.mean(pair_dists)) if pair_dists else 0.0,
+            float(np.max(pair_ious)) if pair_ious else 0.0,
+            float(np.mean(pair_ious)) if pair_ious else 0.0,
+            float(np.max(pair_approaches)) if pair_approaches else 0.0,
+            float(np.min(strike_dists)) if strike_dists else 1.0,
+            float(np.mean(strike_dists)) if strike_dists else 1.0,
+            float(flow_mean),
+            float(flow_peak),
+            float(np.max(aspect_ratio_changes)) if aspect_ratio_changes else 0.0,
+            float(len(current_tids))
+        ]
+
         return np.array(features, dtype=np.float32)
-    
-    def _wrist_velocity(self, pose_history):
+
+    def _compute_joint_dynamics(self, kp_prev, kp_curr):
         """
-        Approximate wrist speed from the last 2 frames.
-        COCO landmark 9 = left wrist, 10 = right wrist.
-        Returns the maximum wrist speed (left or right).
+        COCO 17 Index Mapping:
+          0: Nose (Head)
+          5, 6: Shoulders
+          7, 8: Elbows
+          9, 10: Wrists
+          11, 12: Hips
+          13, 14: Knees
+          15, 16: Ankles
         """
-        if len(pose_history) < 2:
+        def joint_speed(idx):
+            p = idx * 3
+            if kp_prev[p+2] > 0.25 and kp_curr[p+2] > 0.25:
+                dx = kp_curr[p] - kp_prev[p]
+                dy = kp_curr[p+1] - kp_prev[p+1]
+                return float(np.sqrt(dx*dx + dy*dy))
             return 0.0
-        prev_kp = pose_history[-2]
-        curr_kp = pose_history[-1]
+
+        # Speeds
+        w_v = max(joint_speed(9), joint_speed(10))
+        e_v = max(joint_speed(7), joint_speed(8))
+        s_v = max(joint_speed(5), joint_speed(6))
+        l_v = max(joint_speed(13), joint_speed(14), joint_speed(15), joint_speed(16))
+        h_v = joint_speed(0)
+
+        # Kinetic energy estimate: sum of squared speeds across all visible joints
+        ke = 0.0
+        for j in range(17):
+            v = joint_speed(j)
+            ke += (v * v)
+
+        return w_v, e_v, s_v, l_v, h_v, ke
+
+    def _bbox_interaction(self, ta, tb):
+        ba = self.bbox_history[ta][-1]
+        bb = self.bbox_history[tb][-1]
+        return self._calc_dist_and_iou(ba, bb)
+
+    def _bbox_interaction_at_offset(self, ta, tb, offset):
+        ba = self.bbox_history[ta][offset]
+        bb = self.bbox_history[tb][offset]
+        return self._calc_dist_and_iou(ba, bb)
+
+    @staticmethod
+    def _calc_dist_and_iou(a, b):
+        cx_a, cy_a = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+        cx_b, cy_b = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        h_avg = ((a[3] - a[1]) + (b[3] - b[1])) / 2.0
+        h_avg = max(h_avg, 1.0)
         
-        # COCO 17 Keypoints (each keypoint is x, y, conf):
-        # Index 9  (Left Wrist)  -> array position 9*3  = 27 (x, y)
-        # Index 10 (Right Wrist) -> array position 10*3 = 30 (x, y)
-        if len(prev_kp) < 33 or len(curr_kp) < 33:
-            return 0.0
-        
-        left_wrist_prev  = prev_kp[27:29]
-        left_wrist_curr  = curr_kp[27:29]
-        right_wrist_prev = prev_kp[30:32]
-        right_wrist_curr = curr_kp[30:32]
-        
-        left_speed  = np.linalg.norm(left_wrist_curr  - left_wrist_prev)
-        right_speed = np.linalg.norm(right_wrist_curr - right_wrist_prev)
-        
-        return float(max(left_speed, right_speed))
-    
-    def _person_distance(self, tid_a, tid_b):
+        dist = np.sqrt((cx_a - cx_b)**2 + (cy_a - cy_b)**2) / h_avg
+
+        # IoU
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        iou = (inter / union) if union > 0 else 0.0
+
+        return float(dist), float(iou)
+
+    def _extremity_to_body_distance(self, kp_a, kp_b, bbox_a, bbox_b):
+        """Measures minimum normalized distance between extremities of A and vital zones of B."""
+        avg_h = ((bbox_a[3] - bbox_a[1]) + (bbox_b[3] - bbox_b[1])) / 2.0
+        if avg_h <= 0:
+            return None
+
+        # Extremity joints: Wrists (9, 10), Ankles (15, 16)
+        extremity_indices = [9, 10, 15, 16]
+        # Vital target zones: Head (0), Shoulders (5, 6), Torso/Hips (11, 12)
+        target_indices = [0, 5, 6, 11, 12]
+
+        min_d = float('inf')
+        for e_idx in extremity_indices:
+            ep = e_idx * 3
+            if kp_a[ep+2] < 0.25:
+                continue
+            ex, ey = kp_a[ep], kp_a[ep+1]
+
+            for t_idx in target_indices:
+                tp = t_idx * 3
+                if kp_b[tp+2] < 0.25:
+                    continue
+                tx, ty = kp_b[tp], kp_b[tp+1]
+                d = np.sqrt((ex - tx)**2 + (ey - ty)**2) / avg_h
+                if d < min_d:
+                    min_d = d
+
+        return min_d if min_d != float('inf') else 1.0
+
+    def _compute_person_masked_flow(self, gray_frame, persons):
         """
-        Euclidean distance between the centers of two people's bounding boxes.
-        Normalized by the average person height (bbox height).
-        """
-        bbox_a = self.bbox_history[tid_a][-1]
-        bbox_b = self.bbox_history[tid_b][-1]
-        
-        cx_a = (bbox_a[0] + bbox_a[2]) / 2
-        cy_a = (bbox_a[1] + bbox_a[3]) / 2
-        cx_b = (bbox_b[0] + bbox_b[2]) / 2
-        cy_b = (bbox_b[1] + bbox_b[3]) / 2
-        
-        pixel_dist = np.sqrt((cx_a - cx_b)**2 + (cy_a - cy_b)**2)
-        
-        avg_height = ((bbox_a[3] - bbox_a[1]) + (bbox_b[3] - bbox_b[1])) / 2
-        if avg_height == 0:
-            return 0.0
-        
-        return float(pixel_dist / avg_height)
-    
-    def _bbox_overlap(self, tid_a, tid_b):
-        """
-        Intersection-over-Union (IoU) between two bounding boxes.
-        """
-        a = self.bbox_history[tid_a][-1]
-        b = self.bbox_history[tid_b][-1]
-        
-        inter_x1 = max(a[0], b[0])
-        inter_y1 = max(a[1], b[1])
-        inter_x2 = min(a[2], b[2])
-        inter_y2 = min(a[3], b[3])
-        
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
-        
-        area_a = (a[2]-a[0]) * (a[3]-a[1])
-        area_b = (b[2]-b[0]) * (b[3]-b[1])
-        union_area = area_a + area_b - inter_area
-        
-        return float(inter_area / union_area) if union_area > 0 else 0.0
-    
-    def _compute_optical_flow(self, gray_frame):
-        """
-        PyTorch GPU Tensor motion differencing.
-        Runs on RTX 4060 CUDA GPU in 0.05 ms per frame!
+        Computes motion differencing ONLY within bounding boxes of detected persons.
+        Completely ignores background motion (e.g., cars, trees, camera shake).
         """
         if self._prev_gray is None:
             self._prev_gray = gray_frame
-            return 0.0
-        
-        import torch
-        # Move downsampled frames to GPU for instant motion tensor calculation
-        curr_small = cv2.resize(gray_frame, (128, 128))
-        prev_small = cv2.resize(self._prev_gray, (128, 128))
-        
-        t_curr = torch.from_numpy(curr_small).to(self.device).float() / 255.0
-        t_prev = torch.from_numpy(prev_small).to(self.device).float() / 255.0
-        
-        motion = torch.mean(torch.abs(t_curr - t_prev)).item() * 50.0
-        self._prev_gray = gray_frame
-        return float(motion)
-    
+            return 0.0, 0.0
+
+        if not persons:
+            return 0.0, 0.0
+
+        h, w = gray_frame.shape
+        # Create lightweight binary mask for detected people
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for p in persons:
+            bbox = p.get('bbox', [0, 0, 0, 0])
+            x1, y1 = max(0, bbox[0]), max(0, bbox[1])
+            x2, y2 = min(w, bbox[2]), min(h, bbox[3])
+            if x2 > x1 and y2 > y1:
+                mask[y1:y2, x1:x2] = 255
+
+        # Frame differencing on masked region
+        diff = cv2.absdiff(gray_frame, self._prev_gray)
+        person_motion = cv2.bitwise_and(diff, diff, mask=mask)
+
+        # Normalize metrics
+        active_pixels = cv2.countNonZero(mask)
+        if active_pixels > 0:
+            mean_motion = float(np.sum(person_motion) / active_pixels)
+            peak_motion = float(np.max(person_motion))
+        else:
+            mean_motion, peak_motion = 0.0, 0.0
+
+        return mean_motion, peak_motion
+
     def reset(self):
-        """Clear all history. Call between unrelated video clips."""
+        """Clears rolling history between clips or on stream reset."""
         self.pose_history.clear()
         self.bbox_history.clear()
+        self.velocity_history.clear()
         self._prev_gray = None
+
 
 
 

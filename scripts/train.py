@@ -133,37 +133,78 @@ def main():
     print()
 
     # Training
-    print("Starting training...\n")
-    model = train_tier2(X_train, y_train, X_val, y_val, epochs=50)
+    print("Starting training with Conv-BiGRU-Attention + Feature Scaling + Data Augmentation...\n")
+    model = train_tier2(X_train, y_train, X_val, y_val, epochs=80)
 
-    # Test-set evaluation 
+    # Test-set evaluation with normalized features
     import torch
+    from src.classifier import FeatureScaler, SCALER_PATH
+    scaler = FeatureScaler()
+    scaler.load(SCALER_PATH)
+    
+    X_val_norm  = scaler.transform(X_val)
+    X_test_norm = scaler.transform(X_test)
+
     device = next(model.parameters()).device
     model.eval()
 
-    X_t = torch.FloatTensor(X_test).to(device)
+    # 1. Calibrate threshold on validation set
     with torch.no_grad():
-        probs = model(X_t).squeeze(1).cpu().numpy()
+        val_probs = model(torch.FloatTensor(X_val_norm).to(device)).squeeze(1).cpu().numpy()
+        test_probs = model(torch.FloatTensor(X_test_norm).to(device)).squeeze(1).cpu().numpy()
 
-    preds   = (probs >= 0.5).astype(int)
+    best_thresh = 0.50
+    best_f1 = 0.0
+    for t in np.linspace(0.35, 0.65, 31):
+        v_pred = (val_probs >= t).astype(int)
+        tp = np.sum((v_pred == 1) & (y_val == 1))
+        fp = np.sum((v_pred == 1) & (y_val == 0))
+        fn = np.sum((v_pred == 0) & (y_val == 1))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = float(t)
+
+    # 2. Evaluate on held-out test set
+    preds = (test_probs >= best_thresh).astype(int)
     correct = (preds == y_test.astype(int)).sum()
     overall_acc = correct / len(y_test) * 100
 
-    print(f"\n{'='*55}")
-    print(f"  Test-set results")
-    print(f"{'='*55}")
-    print(f"  Overall accuracy : {overall_acc:.1f}%  ({correct}/{len(y_test)})")
+    tp = int(np.sum((preds == 1) & (y_test == 1)))
+    fp = int(np.sum((preds == 1) & (y_test == 0)))
+    tn = int(np.sum((preds == 0) & (y_test == 0)))
+    fn = int(np.sum((preds == 0) & (y_test == 1)))
 
-    # Per-dataset accuracy — this is the key cross-dataset generalization check
+    prec = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
+    rec  = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
+    f1_s = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+    print(f"\n{'='*55}")
+    print(f"  HELD-OUT TEST SET EVALUATION")
+    print(f"{'='*55}")
+    print(f"  Calibrated Threshold : {best_thresh:.2f} (Val F1: {best_f1*100:.1f}%)")
+    print(f"  Overall Accuracy     : {overall_acc:.2f}%  ({correct}/{len(y_test)})")
+    print(f"  Precision            : {prec:.2f}%")
+    print(f"  Recall (Sensitivity) : {rec:.2f}%")
+    print(f"  F1-Score             : {f1_s:.2f}%")
+    print(f"  False Positive Rate  : {(fp/(fp+tn)*100):.2f}%")
+    print(f"  Confusion Matrix     : TP={tp}, FP={fp}, TN={tn}, FN={fn}")
+    print(f"{'-'*55}")
+
+    # Per-dataset accuracy
     for src in sorted(set(src_test)):
         mask  = src_test == src
         n     = mask.sum()
         acc   = (preds[mask] == y_test[mask].astype(int)).sum() / n * 100
-        print(f"  {src:<14}  acc: {acc:.1f}%  ({n} clips)")
+        print(f"  {src:<14}  acc: {acc:.2f}%  ({n} clips)")
 
     print(f"\n  Model saved to: {config.TIER2_MODEL_PATH}")
-    print(f"  Run the pipeline:  .\\venv\\Scripts\\python app.py")
+    print(f"  Feature Scaler: {SCALER_PATH}")
+    print(f"  Run the pipeline:  python app.py\n")
 
 
 if __name__ == "__main__":
     main()
+

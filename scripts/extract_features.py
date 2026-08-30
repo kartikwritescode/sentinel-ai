@@ -113,45 +113,44 @@ def gather_clips():
 
 def process_clip(video_path, detector, engineer):
     """
-    Run the full pipeline on one clip (1000% GPU accelerated).
+    Extracts a contiguous sequence of 30 frames of 24-D features from a clip.
+    Ensures natural kinematic velocities without large frame skipping jumps.
     """
-    engineer.reset()   # clear history between clips — very important
+    engineer.reset()
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames < 2:
+    if total_frames < 5:
         cap.release()
         return None
 
-    # Calculate target frame indices to sample
-    step = max(total_frames // FRAMES_PER_CLIP, 1)
-    target_indices = set(i * step for i in range(FRAMES_PER_CLIP))
+    # Pick contiguous start frame index (center window for fight/action clips)
+    if total_frames >= FRAMES_PER_CLIP:
+        start_frame = (total_frames - FRAMES_PER_CLIP) // 2
+    else:
+        start_frame = 0
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     feature_sequence = []
-    current_frame_idx = 0
-
-    while cap.isOpened():
+    while cap.isOpened() and len(feature_sequence) < FRAMES_PER_CLIP:
         success, frame = cap.read()
-        if not success:
+        if not success or frame is None:
             break
 
-        if current_frame_idx in target_indices:
-            # 1. Detect + track + pose estimate in 1 single pass on CUDA GPU
-            persons = detector.detect_and_track(frame)
-
-            # 2. Compute feature vector for this frame
-            feat = engineer.update(frame, persons)
-            feature_sequence.append(feat)
-
-            if len(feature_sequence) == FRAMES_PER_CLIP:
-                break
-
-        current_frame_idx += 1
+        # Detect people + pose on GPU in single pass
+        persons = detector.detect_and_track(frame)
+        feat = engineer.update(frame, persons)
+        feature_sequence.append(feat)
 
     cap.release()
 
-    if len(feature_sequence) < FRAMES_PER_CLIP:
-        return None   # clip too short
+    if not feature_sequence:
+        return None
+
+    # If clip is slightly shorter than FRAMES_PER_CLIP, pad with last valid feature vector
+    while len(feature_sequence) < FRAMES_PER_CLIP:
+        feature_sequence.append(feature_sequence[-1].copy())
 
     return np.stack(feature_sequence[:FRAMES_PER_CLIP], axis=0)
 
@@ -168,13 +167,29 @@ def main():
         print("ERROR: No video clips found. Check DATA_SOURCES paths above.")
         return
 
+    chk_x = OUTPUT_DIR / "X_tier2_partial.npy"
+    chk_y = OUTPUT_DIR / "y_tier2_partial.npy"
+    chk_s = OUTPUT_DIR / "sources_partial.npy"
+
     X_list, y_list, src_list = [], [], []
     skipped = 0
     total   = len(clips)
 
-    for i, (video_path, label, dataset_name) in enumerate(clips):
-        # \r overwrites the same line each iteration — shows rolling progress
-        print(f"[{i+1}/{total}]  {dataset_name:<12}  {os.path.basename(video_path):<40}", end="\r")
+    if chk_x.exists() and chk_y.exists() and chk_s.exists():
+        try:
+            X_list = list(np.load(chk_x))
+            y_list = list(np.load(chk_y))
+            src_list = list(np.load(chk_s, allow_pickle=True))
+            print(f"Resuming from checkpoint with {len(X_list)} clips already extracted.")
+        except Exception:
+            pass
+
+    start_idx = len(X_list)
+
+    for i in range(start_idx, total):
+        video_path, label, dataset_name = clips[i]
+        if (i + 1) % 50 == 0 or i == total - 1:
+            print(f"[{i+1}/{total}] ({(i+1)/total*100:.1f}%) Processing: {dataset_name} - {os.path.basename(video_path)}")
 
         seq = process_clip(video_path, detector, engineer)
         if seq is None:
@@ -185,19 +200,31 @@ def main():
         y_list.append(label)
         src_list.append(dataset_name)
 
-    print()  # newline after \r progress
+        # Checkpoint every 200 clips
+        if len(X_list) % 200 == 0:
+            np.save(chk_x, np.array(X_list, dtype=np.float32))
+            np.save(chk_y, np.array(y_list, dtype=np.float32))
+            np.save(chk_s, np.array(src_list, dtype=object))
 
     if not X_list:
         print("ERROR: All clips were skipped. Check dataset paths.")
         return
 
-    X       = np.array(X_list,  dtype=np.float32)   # (N, frames, features)
-    y       = np.array(y_list,  dtype=np.float32)   # (N,)
-    sources = np.array(src_list, dtype=object)       # (N,)  string array
+    X       = np.array(X_list,  dtype=np.float32)
+    y       = np.array(y_list,  dtype=np.float32)
+    sources = np.array(src_list, dtype=object)
 
     np.save(OUTPUT_DIR / "X_tier2.npy", X)
     np.save(OUTPUT_DIR / "y_tier2.npy", y)
     np.save(OUTPUT_DIR / "sources.npy", sources)
+
+    # Clean up partial files
+    for p in [chk_x, chk_y, chk_s]:
+        if p.exists():
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
     # Final summary 
     print(f"\n{'='*55}")

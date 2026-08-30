@@ -1,3 +1,4 @@
+import time
 import cv2
 import numpy as np
 from src.video_source import VideoSource
@@ -17,12 +18,12 @@ SKELETON_CONNECTIONS = [
     (12, 14), (14, 16)                   # Right Leg
 ]
 
-def draw_visual_overlays(frame, persons, confidence, is_alerting):
+def draw_visual_overlays(frame, persons, confidence, is_alerting, fps_val=0.0):
     """
     Draws professional CCTV overlays:
     - Bounding boxes & Track IDs
     - Pose Skeleton joints and bones
-    - Top HUD Status Banner (Normal / Warning / Alarm)
+    - Top HUD Status Banner (Normal / Warning / Alarm) with FPS & person count
     """
     h, w = frame.shape[:2]
 
@@ -55,12 +56,12 @@ def draw_visual_overlays(frame, persons, confidence, is_alerting):
             for p1_idx, p2_idx in SKELETON_CONNECTIONS:
                 x_a, y_a, c_a = pts[p1_idx]
                 x_b, y_b, c_b = pts[p2_idx]
-                if c_a > 0.3 and c_b > 0.3 and x_a > 0 and x_b > 0:
+                if c_a > 0.25 and c_b > 0.25 and x_a > 0 and x_b > 0:
                     cv2.line(frame, (x_a, y_a), (x_b, y_b), (255, 255, 0), 2)
 
             # Draw joint dots
             for px, py, conf in pts:
-                if conf > 0.3 and px > 0 and py > 0:
+                if conf > 0.25 and px > 0 and py > 0:
                     cv2.circle(frame, (px, py), 4, (0, 165, 255), -1)
 
     # 2. Draw Top HUD Banner
@@ -70,26 +71,22 @@ def draw_visual_overlays(frame, persons, confidence, is_alerting):
     conf_str = f"{confidence * 100:.1f}%" if confidence is not None else "Analyzing..."
 
     if is_alerting:
-        status_text = f"ALERT: SUSPICIOUS BEHAVIOR DETECTED! ({conf_str})"
+        status_text = f"ALERT: SUSPICIOUS BEHAVIOR DETECTED! ({conf_str}) | {fps_val:.1f} FPS"
         text_color = (0, 255, 255)
-    elif confidence is not None and confidence >= 0.5:
-        status_text = f"WARNING: ELEVATED MOTION ({conf_str})"
+    elif confidence is not None and confidence >= 0.50:
+        status_text = f"WARNING: ELEVATED MOTION ({conf_str}) | {fps_val:.1f} FPS"
         text_color = (0, 165, 255)
     else:
-        status_text = f"SYSTEM NORMAL | Conf: {conf_str} | People: {len(persons)}"
+        status_text = f"SYSTEM NORMAL | Conf: {conf_str} | People: {len(persons)} | {fps_val:.1f} FPS"
         text_color = (0, 255, 0)
 
     cv2.putText(frame, status_text, (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
 
 
 def run_pipeline(video_source_arg, display=True):
     """
-    Main CCTV Pipeline Entry Point.
-
-    Args:
-        video_source_arg: 0 (for webcam) or path to video file (e.g. 'clip.mp4')
-        display: bool — if True, opens a real-time OpenCV desktop window
+    Main CCTV Pipeline Entry Point with smooth asynchronous execution.
     """
     print(f"\n[CCTV Pipeline] Starting video source: {video_source_arg}")
     print("[CCTV Pipeline] Press 'q' in the video window to stop.\n")
@@ -101,34 +98,38 @@ def run_pipeline(video_source_arg, display=True):
     logger     = EventLogger()
     clip_writer = EvidenceClipWriter()
 
-    window_name = "Smart CCTV - Real-Time Surveillance Feed (Press 'q' to exit)"
+    window_name = "Smart CCTV - Sentinel AI Real-Time Surveillance (Press 'q' to exit)"
 
     latest_confidence = None
-    is_alerting = False
+    fps_display = 30.0
+    frame_times = []
 
     with VideoSource(video_source_arg) as source:
         fps = source.get_fps()
         clip_writer.fps = fps
 
         for frame in source:
+            t0 = time.time()
+
             # 1. Detect people + pose on GPU in a single pass
             persons = detector.detect_and_track(frame)
 
-            # 2. Compute motion & interaction features
+            # 2. Compute motion & interaction features (24-D)
             feature_vec = engineer.update(frame, persons)
 
-            # 3. Always maintain pre-event video clip buffer
+            # 3. Maintain rolling pre-event video clip buffer
             clip_writer.push_frame(frame)
 
+            new_alert_triggered = False
             if feature_vec is not None:
-                # 4. Infer suspicion probability using Tier 2 GRU
+                # 4. Infer suspicion probability using Attention-BiGRU
                 conf = inferencer.push_features(feature_vec)
                 if conf is not None:
                     latest_confidence = conf
-                    # 5. Debounce alerts (requires N consecutive positive windows)
-                    is_alerting = debouncer.update(latest_confidence)
+                    # 5. Debounce with hysteresis & cooldown
+                    new_alert_triggered = debouncer.update(latest_confidence)
 
-                    if is_alerting:
+                    if new_alert_triggered:
                         clip_path = clip_writer.trigger_save()
                         timestamp = logger.log_event(
                             confidence=latest_confidence,
@@ -143,21 +144,30 @@ def run_pipeline(video_source_arg, display=True):
                             person_count=len(persons)
                         )
 
-                        # Set callback on clip_writer so when the video finishes writing to disk,
-                        # it dispatches the evidence video directly to Telegram
+                        # Set async callback on clip completion for Telegram video dispatch
                         def make_send_callback(msg):
                             def _callback(saved_video_path):
-                                send_telegram_alert(message=msg, video_path=saved_video_path)
+                                send_telegram_alert(message=msg, video_path=saved_video_path, async_mode=True)
                             return _callback
 
                         clip_writer.on_clip_complete = make_send_callback(formatted_msg)
 
-                        # Send immediate text notification while video is recording
-                        send_telegram_alert(message=formatted_msg)
+                        # Send immediate non-blocking text notification
+                        send_telegram_alert(message=formatted_msg, async_mode=True)
+
+            is_alarm_active = debouncer.is_alarm_active()
+
+            # Calculate rolling real-time FPS
+            t1 = time.time()
+            frame_times.append(t1 - t0)
+            if len(frame_times) > 15:
+                frame_times.pop(0)
+            avg_dt = np.mean(frame_times) if frame_times else 0.033
+            fps_display = 1.0 / avg_dt if avg_dt > 0 else 30.0
 
             # 6. Render visual overlays and display desktop window
             if display:
-                draw_visual_overlays(frame, persons, latest_confidence, is_alerting)
+                draw_visual_overlays(frame, persons, latest_confidence, is_alarm_active, fps_display)
                 cv2.imshow(window_name, frame)
 
                 # Exit if user presses 'q' or closes window

@@ -19,27 +19,26 @@ FEATURE_WINDOW_FRAMES = 30  # 1 second if 30fps vid
 
 
 TIER2_MODEL_PATH  = 'models/tier2_gru.pt'
-# must match the number of values FeatureEngineer.update() returns.
-# Current features: mean_wrist_vel, max_wrist_vel, mean_pair_dist/iou, max_pair_dist/iou, optical_flow_magnitude, person_count = 6 total.
-TIER2_INPUT_SIZE  = 6
-TIER2_HIDDEN_SIZE = 128   # bumped from 64 — RTX 4060 handles this easily
+# 24-D Kinematic & Multi-Person Spatial Interaction Feature Vector
+TIER2_INPUT_SIZE  = 24
+TIER2_HIDDEN_SIZE = 128
 TIER2_NUM_LAYERS  = 2
 
 # GPU / Training settings 
-# torch.device auto-selects CUDA if available, falls back to CPU
-TRAINING_DEVICE     = 'cuda'   # force CUDA — will error loudly if no GPU found
-TRAINING_BATCH_SIZE = 64       # mini-batch size — GPU needs batches to be fast
-TRAINING_EPOCHS     = 80       # more epochs since GPU is fast enough
+TRAINING_DEVICE     = 'cuda'
+TRAINING_BATCH_SIZE = 64
+TRAINING_EPOCHS     = 60
+LEARNING_RATE       = 1e-3
 
+# Alerting & Hysteresis settings
+ALERT_CONF_HIGH          = 0.75   # Threshold to trigger alert state
+ALERT_CONF_LOW           = 0.40   # Threshold to release alert state (hysteresis)
+ALERT_SUSTAINED_FRAMES   = 15     # Must sustain high confidence for >= 15 frames (~0.5s at 30fps)
+ALERT_COOLDOWN_SECONDS   = 15.0   # Minimum seconds between successive alert dispatches
+PRE_EVENT_BUFFER_SECONDS = 4      # Seconds of footage to save BEFORE the alert
+POST_EVENT_RECORD_SECONDS= 3      # Seconds AFTER alert trigger to keep recording
 
-# alerting
-
-ALERT_DEBOUNCE_WINDOWS = 3         # need 3 consecutive suspicious windows to fire
-ALERT_CONFIDENCE_THRESH = 0.7     # minimum model confidence to even count a window
-PRE_EVENT_BUFFER_SECONDS = 5      # seconds of footage to save BEFORE the alert
-POST_EVENT_RECORD_SECONDS = 3     # seconds AFTER alert trigger to keep recording
-
-SQLITE_DB_PATH = 'data/events.db'
+SQLITE_DB_PATH     = 'data/events.db'
 EVIDENCE_CLIPS_DIR = 'data/evidence_clips'
 
 # loaded from .env 
