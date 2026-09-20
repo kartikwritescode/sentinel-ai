@@ -1,210 +1,313 @@
 """
-Step 2 training.
+scripts/train.py
+────────────────
+Production Training Pipeline for Sentinel AI.
 
-Loads the pre-extracted feature arrays (output of extract_features.py),
-splits them into train/val/test sets (stratified so each split keeps
-a proportional mix of both datasets), and trains the Tier 2 GRU classifier.
+Supports:
+  1. Vision-BiLSTM Classifier (--model vision_bilstm):
+     High-performing MobileNetV2 + BiLSTM + Attention architecture based on cctv-classification.ipynb.
+  2. Kinematic Pose Classifier (--model pose_gru):
+     Tier-2 Conv1D-BiLSTM on 34-D scale-normalized pose & dynamics features.
+  3. Hybrid Dual-Stream Classifier (--model hybrid):
+     Fuses vision and kinematic features via gated cross-modal attention.
 
-Run from the project root:
-    .\\venv\\Scripts\\python scripts/train.py
-
-Expects:
-    data/X_tier2.npy      (produced by extract_features.py)
-    data/y_tier2.npy
-    data/sources.npy      (dataset name per clip -> optional but used for reporting)
-
-Saves:
-    models/tier2_gru.pt   (best checkpoint by validation loss)
+Usage Examples:
+  python scripts/train.py --model vision_bilstm --epochs 35 --batch-size 32
+  python scripts/train.py --model vision_bilstm --dataset scvd --epochs 30
+  python scripts/train.py --model pose_gru --epochs 120 --batch-size 64
 """
 
 import sys
 import os
+import argparse
+import json
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import numpy as np
-from pathlib import Path
+import torch
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
 
 import config
-from src.classifier import train_tier2
+from src.classifier import (
+    VisionBiLSTMClassifier,
+    SuspiciousActivityClassifier,
+    FeatureScaler,
+    SCALER_PATH,
+    train_vision_classifier,
+    train_tier2
+)
 
 
-def stratified_split(X, y, sources, train_ratio=0.80, val_ratio=0.10, seed=42):
+def stratified_split(X, y, sources, clip_ids=None,
+                     train_ratio=0.80, val_ratio=0.10, seed=42):
     """
-    Split arrays into train/val/test while keeping the same class ratio in each split.
-
-    Why stratified? If we just shuffle and cut, we might end up with 90% Fight in
-    the test set by bad luck. Stratification guarantees each split mirrors the
-    original class distribution.
-
-    Args:
-        X, y, sources : arrays of the same length N
-        train_ratio   : fraction for training (default 80%)
-        val_ratio     : fraction for validation (default 10%)
-                        remaining (10%) goes to test
-
-    Returns:
-        six arrays: X_train, y_train, X_val, y_val, X_test, y_test
-        plus sources_test for cross-dataset analysis
+    Split arrays into train/val/test while keeping:
+    1. The same class ratio in each split (stratified)
+    2. All crops from the same clip in the same split (clip-aware)
     """
     rng = np.random.default_rng(seed=seed)
+
+    if clip_ids is None:
+        clip_ids = np.arange(len(X))
 
     X_train_list, y_train_list = [], []
     X_val_list,   y_val_list   = [], []
     X_test_list,  y_test_list  = [], []
     src_test_list              = []
+    cid_test_list              = []
 
-    # Split independently for each class (0 and 1) to preserve proportions
     for cls in [0, 1]:
-        idx = np.where(y == cls)[0]
-        idx = rng.permutation(idx)               # shuffle within class
+        cls_mask = (y == cls)
+        cls_clip_ids = clip_ids[cls_mask]
+        unique_clips = np.unique(cls_clip_ids)
+        unique_clips = rng.permutation(unique_clips)
 
-        n        = len(idx)
-        n_train  = int(n * train_ratio)
-        n_val    = int(n * val_ratio)
+        n_clips    = len(unique_clips)
+        n_train    = int(n_clips * train_ratio)
+        n_val      = int(n_clips * val_ratio)
 
-        X_train_list.append(X[idx[:n_train]])
-        y_train_list.append(y[idx[:n_train]])
+        train_clips = set(unique_clips[:n_train])
+        val_clips   = set(unique_clips[n_train:n_train + n_val])
+        test_clips  = set(unique_clips[n_train + n_val:])
 
-        X_val_list.append(X[idx[n_train:n_train + n_val]])
-        y_val_list.append(y[idx[n_train:n_train + n_val]])
+        for idx in range(len(X)):
+            if y[idx] != cls:
+                continue
+            cid = clip_ids[idx]
+            if cid in train_clips:
+                X_train_list.append(X[idx])
+                y_train_list.append(y[idx])
+            elif cid in val_clips:
+                X_val_list.append(X[idx])
+                y_val_list.append(y[idx])
+            elif cid in test_clips:
+                X_test_list.append(X[idx])
+                y_test_list.append(y[idx])
+                src_test_list.append(sources[idx])
+                cid_test_list.append(cid)
 
-        X_test_list.append(X[idx[n_train + n_val:]])
-        y_test_list.append(y[idx[n_train + n_val:]])
-        src_test_list.append(sources[idx[n_train + n_val:]])
-
-    # Concatenate and shuffle the final train set
-    # (otherwise it's [all fight, all nonfight] which biases the GRU training)
-    X_train = np.concatenate(X_train_list)
-    y_train = np.concatenate(y_train_list)
+    X_train = np.array(X_train_list)
+    y_train = np.array(y_train_list)
     train_idx = rng.permutation(len(X_train))
     X_train, y_train = X_train[train_idx], y_train[train_idx]
 
-    X_val     = np.concatenate(X_val_list)
-    y_val     = np.concatenate(y_val_list)
+    X_val     = np.array(X_val_list)
+    y_val     = np.array(y_val_list)
+    X_test    = np.array(X_test_list)
+    y_test    = np.array(y_test_list)
+    src_test  = np.array(src_test_list)
+    cid_test  = np.array(cid_test_list)
 
-    X_test    = np.concatenate(X_test_list)
-    y_test    = np.concatenate(y_test_list)
-    src_test  = np.concatenate(src_test_list)
-
-    return X_train, y_train, X_val, y_val, X_test, y_test, src_test
+    return X_train, y_train, X_val, y_val, X_test, y_test, src_test, cid_test
 
 
-def main():
-    # Load pre-extracted features 
-    x_path   = Path("data/X_tier2.npy")
-    y_path   = Path("data/y_tier2.npy")
-    src_path = Path("data/sources.npy")
-
-    if not x_path.exists() or not y_path.exists():
-        print("ERROR: Feature arrays not found.")
-        print("  Run first:  .\\venv\\Scripts\\python scripts/extract_features.py")
-        return
-
-    X       = np.load(x_path)
-    y       = np.load(y_path)
-    sources = np.load(src_path, allow_pickle=True) if src_path.exists() else np.array(["unknown"] * len(X))
-
-    print(f"Loaded arrays:")
-    print(f"  X       : {X.shape}")
-    print(f"  y       : {y.shape}   Fight={int(y.sum())}  NonFight={int((y==0).sum())}")
-
-    # Per-dataset breakdown
-    for src in sorted(set(sources)):
-        mask = sources == src
-        print(f"  {src:<14}  Fight: {int(y[mask].sum()):>5}   NonFight: {int((y[mask]==0).sum()):>5}")
-    print()
-
-    if X.shape[2] != config.TIER2_INPUT_SIZE:
-        print(f"ERROR: Feature size mismatch!")
-        print(f"  X has {X.shape[2]} features per frame but config.TIER2_INPUT_SIZE = {config.TIER2_INPUT_SIZE}")
-        print(f"  Fix: set TIER2_INPUT_SIZE = {X.shape[2]} in config.py, then rerun.")
-        return
-
-    # Stratified split 
-    X_train, y_train, X_val, y_val, X_test, y_test, src_test = stratified_split(
-        X, y, sources, train_ratio=0.80, val_ratio=0.10
-    )
-    print(f"Split (stratified 80/10/10):")
-    print(f"  train : {len(X_train):>5}  (Fight={int(y_train.sum())}, NonFight={int((y_train==0).sum())})")
-    print(f"  val   : {len(X_val):>5}  (Fight={int(y_val.sum())}, NonFight={int((y_val==0).sum())})")
-    print(f"  test  : {len(X_test):>5}  (Fight={int(y_test.sum())}, NonFight={int((y_test==0).sum())})")
-    print()
-
-    # Training
-    print("Starting training with Conv-BiGRU-Attention + Feature Scaling + Data Augmentation...\n")
-    model = train_tier2(X_train, y_train, X_val, y_val, epochs=80)
-
-    # Test-set evaluation with normalized features
-    import torch
-    from src.classifier import FeatureScaler, SCALER_PATH
-    scaler = FeatureScaler()
-    scaler.load(SCALER_PATH)
-    
-    X_val_norm  = scaler.transform(X_val)
-    X_test_norm = scaler.transform(X_test)
-
+def evaluate_and_log(model, X_test, y_test, src_test, cid_test, calibrated_thresh=0.50, model_name="vision_bilstm"):
+    """Evaluates trained model on test set and saves eval report."""
     device = next(model.parameters()).device
     model.eval()
 
-    # 1. Calibrate threshold on validation set
     with torch.no_grad():
-        val_probs = model(torch.FloatTensor(X_val_norm).to(device)).squeeze(1).cpu().numpy()
-        test_probs = model(torch.FloatTensor(X_test_norm).to(device)).squeeze(1).cpu().numpy()
+        test_probs = model(torch.FloatTensor(X_test).to(device)).squeeze(1).cpu().numpy()
 
-    best_thresh = 0.50
-    best_f1 = 0.0
-    for t in np.linspace(0.35, 0.65, 31):
-        v_pred = (val_probs >= t).astype(int)
-        tp = np.sum((v_pred == 1) & (y_val == 1))
-        fp = np.sum((v_pred == 1) & (y_val == 0))
-        fn = np.sum((v_pred == 0) & (y_val == 1))
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
-        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thresh = float(t)
+    preds = (test_probs >= calibrated_thresh).astype(int)
+    targets = y_test.astype(int)
 
-    # 2. Evaluate on held-out test set
-    preds = (test_probs >= best_thresh).astype(int)
-    correct = (preds == y_test.astype(int)).sum()
-    overall_acc = correct / len(y_test) * 100
+    tp = int(np.sum((preds == 1) & (targets == 1)))
+    fp = int(np.sum((preds == 1) & (targets == 0)))
+    tn = int(np.sum((preds == 0) & (targets == 0)))
+    fn = int(np.sum((preds == 0) & (targets == 1)))
 
-    tp = int(np.sum((preds == 1) & (y_test == 1)))
-    fp = int(np.sum((preds == 1) & (y_test == 0)))
-    tn = int(np.sum((preds == 0) & (y_test == 0)))
-    fn = int(np.sum((preds == 0) & (y_test == 1)))
+    total = len(targets)
+    acc = (tp + tn) / total * 100.0 if total > 0 else 0.0
+    prec = tp / (tp + fp) * 100.0 if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) * 100.0 if (tp + fn) > 0 else 0.0
+    spec = tn / (tn + fp) * 100.0 if (tn + fp) > 0 else 0.0
+    f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+    macro_f1 = f1_score(targets, preds, average="macro") * 100.0
+    weighted_f1 = f1_score(targets, preds, average="weighted") * 100.0
+    fpr = fp / (fp + tn) * 100.0 if (fp + tn) > 0 else 0.0
 
-    prec = (tp / (tp + fp) * 100) if (tp + fp) > 0 else 0.0
-    rec  = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0.0
-    f1_s = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
-
-    print(f"\n{'='*55}")
-    print(f"  HELD-OUT TEST SET EVALUATION")
-    print(f"{'='*55}")
-    print(f"  Calibrated Threshold : {best_thresh:.2f} (Val F1: {best_f1*100:.1f}%)")
-    print(f"  Overall Accuracy     : {overall_acc:.2f}%  ({correct}/{len(y_test)})")
+    print(f"\n{'='*65}")
+    print(f"  HELD-OUT TEST SET EVALUATION ({model_name.upper()})")
+    print(f"{'='*65}")
+    print(f"  Calibrated Threshold : {calibrated_thresh:.2f}")
+    print(f"  Test Set Size        : {total} samples")
+    print(f"  -------------------------------------------------------------")
+    print(f"  Accuracy             : {acc:.2f}%")
+    print(f"  Macro F1             : {macro_f1:.2f}%")
+    print(f"  Weighted F1          : {weighted_f1:.2f}%")
     print(f"  Precision            : {prec:.2f}%")
     print(f"  Recall (Sensitivity) : {rec:.2f}%")
-    print(f"  F1-Score             : {f1_s:.2f}%")
-    print(f"  False Positive Rate  : {(fp/(fp+tn)*100):.2f}%")
-    print(f"  Confusion Matrix     : TP={tp}, FP={fp}, TN={tn}, FN={fn}")
-    print(f"{'-'*55}")
+    print(f"  Specificity          : {spec:.2f}%")
+    print(f"  False Positive Rate  : {fpr:.2f}%")
+    print(f"  -------------------------------------------------------------")
+    print(f"  Confusion Matrix     : TP={tp} | FP={fp} | TN={tn} | FN={fn}")
+    print(f"  -------------------------------------------------------------")
 
-    # Per-dataset accuracy
+    # Per-dataset breakdown
+    dataset_metrics = {}
+    print(f"  Per-Dataset Accuracy:")
     for src in sorted(set(src_test)):
-        mask  = src_test == src
-        n     = mask.sum()
-        acc   = (preds[mask] == y_test[mask].astype(int)).sum() / n * 100
-        print(f"  {src:<14}  acc: {acc:.2f}%  ({n} clips)")
+        mask = (src_test == src)
+        sub_correct = np.sum(preds[mask] == targets[mask])
+        sub_total = np.sum(mask)
+        sub_acc = sub_correct / sub_total * 100.0 if sub_total > 0 else 0.0
+        sub_f1 = f1_score(targets[mask], preds[mask], average="macro", zero_division=0) * 100.0
+        print(f"    {str(src):<14}: {sub_acc:6.2f}% (Acc) | {sub_f1:6.2f}% (Macro F1) | {sub_correct}/{sub_total} clips")
+        dataset_metrics[str(src)] = {
+            "total": int(sub_total),
+            "correct": int(sub_correct),
+            "accuracy_pct": round(sub_acc, 2),
+            "macro_f1_pct": round(sub_f1, 2)
+        }
 
-    print(f"\n  Model saved to: {config.TIER2_MODEL_PATH}")
-    print(f"  Feature Scaler: {SCALER_PATH}")
-    print(f"  Run the pipeline:  python app.py\n")
+    report = {
+        "model_name": model_name,
+        "calibrated_threshold": round(calibrated_thresh, 2),
+        "test_samples": total,
+        "metrics": {
+            "accuracy_pct": round(acc, 2),
+            "macro_f1_pct": round(macro_f1, 2),
+            "weighted_f1_pct": round(weighted_f1, 2),
+            "precision_pct": round(prec, 2),
+            "recall_pct": round(rec, 2),
+            "specificity_pct": round(spec, 2),
+            "false_positive_rate_pct": round(fpr, 2)
+        },
+        "confusion_matrix": {
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn
+        },
+        "per_dataset": dataset_metrics
+    }
+
+    report_path = Path("data/eval_report.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=4)
+    print(f"\n  Saved full evaluation report to: {report_path.resolve()}\n")
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sentinel AI Model Training Entry Point")
+    parser.add_argument("--model", type=str, default="vision_bilstm",
+                        choices=["vision_bilstm", "pose_gru"],
+                        help="Model architecture to train: 'vision_bilstm' or 'pose_gru'")
+    parser.add_argument("--dataset", type=str, default="all",
+                        choices=["all", "scvd", "rlvs", "rwf"],
+                        help="Dataset selection: 'all' (Unified RLVS+RWF+SCVD), 'scvd', 'rlvs', 'rwf'")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Number of training epochs (default: 35 for vision, 120 for pose)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Batch size (default: 32 for vision, 64 for pose)")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate (default: 1e-3)")
+    parser.add_argument("--weight-decay", type=float, default=1e-4,
+                        help="Weight decay for AdamW")
+    parser.add_argument("--focal-alpha", type=float, default=0.50,
+                        help="Focal Loss alpha for violence class (use 0.65 - 0.70 for max fight recall)")
+    parser.add_argument("--target-recall", type=float, default=None,
+                        help="Target validation recall (e.g. 0.98 to guarantee zero missed fights)")
+    args = parser.parse_args()
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    print(f"\n{'='*65}")
+    print(f"  SENTINEL AI -- MODEL TRAINING PIPELINE (GPU ACCELERATED)")
+    print(f"{'='*65}")
+    print(f"  Model Architecture : {args.model}")
+    print(f"  Dataset Scope      : {args.dataset.upper()}")
+
+    # 1. Load Data Arrays
+    if args.model == "vision_bilstm":
+        epochs = args.epochs if args.epochs is not None else 35
+        batch_size = args.batch_size if args.batch_size is not None else 64
+        x_path = Path("data/X_vision.npy")
+        y_path = Path("data/y_vision.npy")
+        src_path = Path("data/sources_vision.npy")
+        cid_path = Path("data/clip_ids_vision.npy")
+
+        if not x_path.exists():
+            print(f"\nERROR: Vision features not found at {x_path}.")
+            print("  Run first: python scripts/extract_vision_features.py\n")
+            return
+    else:
+        epochs = args.epochs if args.epochs is not None else 120
+        batch_size = args.batch_size if args.batch_size is not None else 64
+        x_path = Path("data/X_tier2.npy")
+        y_path = Path("data/y_tier2.npy")
+        src_path = Path("data/sources.npy")
+        cid_path = Path("data/clip_ids.npy")
+
+        if not x_path.exists():
+            print(f"\nERROR: Tier-2 kinematic features not found at {x_path}.")
+            print("  Run first: python scripts/extract_features.py\n")
+            return
+
+    X = np.load(x_path)
+    y = np.load(y_path)
+    sources = np.load(src_path, allow_pickle=True) if src_path.exists() else np.array(["unknown"] * len(X))
+    cids = np.load(cid_path) if cid_path.exists() else np.arange(len(X))
+
+    # Filter dataset if specific subset requested
+    if args.dataset != "all":
+        mask = np.array([args.dataset.upper() in str(s).upper() for s in sources])
+        X = X[mask]
+        y = y[mask]
+        sources = sources[mask]
+        cids = cids[mask]
+        print(f"  Filtered to dataset '{args.dataset}': {len(X)} samples remaining.")
+
+    print(f"  Loaded Arrays      : X={X.shape}, y={y.shape}")
+    print(f"  Class Distribution : Fight/Violence={int(y.sum())} ({y.sum()/len(y)*100:.1f}%), "
+          f"NonFight/Normal={int((y==0).sum())} ({(y==0).sum()/len(y)*100:.1f}%)")
+    print(f"  Dataset Sources    : {', '.join(sorted(set(sources)))}")
+
+    # 2. Stratified Split (80 / 10 / 10)
+    X_train, y_train, X_val, y_val, X_test, y_test, src_test, cid_test = stratified_split(
+        X, y, sources, clip_ids=cids, train_ratio=0.80, val_ratio=0.10, seed=42
+    )
+    print(f"\n  Stratified Split:")
+    print(f"    Train : {len(X_train):>5} samples (Fight={int(y_train.sum())}, NonFight={int((y_train==0).sum())})")
+    print(f"    Val   : {len(X_val):>5} samples (Fight={int(y_val.sum())}, NonFight={int((y_val==0).sum())})")
+    print(f"    Test  : {len(X_test):>5} samples (Fight={int(y_test.sum())}, NonFight={int((y_test==0).sum())})")
+
+    # 3. Train Selected Model
+    if args.model == "vision_bilstm":
+        ckpt_path = config.VISION_MODEL_PATH
+        model = train_vision_classifier(
+            X_train, y_train, X_val, y_val,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            checkpoint_path=ckpt_path,
+            alpha=args.focal_alpha,
+            target_recall=args.target_recall
+        )
+        # Get calibrated threshold
+        thresh = getattr(model, 'calibrated_threshold', 0.50)
+        evaluate_and_log(model, X_test, y_test, src_test, cid_test,
+                         calibrated_thresh=thresh, model_name=f"vision_bilstm_{args.dataset}")
+
+    elif args.model == "pose_gru":
+        # Feature scaling for kinematic features
+        scaler = FeatureScaler()
+        X_train_norm = scaler.fit_transform(X_train)
+        X_val_norm = scaler.transform(X_val)
+        X_test_norm = scaler.transform(X_test)
+        scaler.save(SCALER_PATH)
+
+        model = train_tier2(X_train, y_train, X_val, y_val, epochs=epochs, batch_size=batch_size)
+        evaluate_and_log(model, X_test_norm, y_test, src_test, cid_test,
+                         calibrated_thresh=0.50, model_name=f"pose_gru_{args.dataset}")
 
 
 if __name__ == "__main__":
     main()
-
+    sys.exit(0)

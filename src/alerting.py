@@ -8,6 +8,7 @@ import cv2
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 import config
 
 # Global asynchronous background task executor for non-blocking alerting & network calls
@@ -151,19 +152,20 @@ class EvidenceClipWriter:
 
 class AlertDebouncer:
     """
-    Intelligent Hysteresis and Cooldown Debouncer.
+    Intelligent Multi-Person Hysteresis and Cooldown Debouncer.
     
     Rules:
-      1. Trigger requires sustained confidence >= ALERT_CONF_HIGH for ALERT_SUSTAINED_FRAMES.
-      2. Alarm state stays active until confidence drops below ALERT_CONF_LOW (hysteresis).
-      3. Enforces an ALERT_COOLDOWN_SECONDS between successive notification dispatches.
+      1. Requires >= 2 persons for fight confirmation (cannot brawl alone or in empty room).
+      2. Trigger requires sustained confidence >= conf_high for sustained_frames (~0.25s).
+      3. Alarm state immediately releases when confidence drops below conf_low or persons < 2.
+      4. Enforces cooldown between successive Telegram alerts.
     """
     def __init__(
         self,
-        conf_high=getattr(config, 'ALERT_CONF_HIGH', 0.75),
-        conf_low=getattr(config, 'ALERT_CONF_LOW', 0.40),
-        sustained_frames=getattr(config, 'ALERT_SUSTAINED_FRAMES', 15),
-        cooldown_seconds=getattr(config, 'ALERT_COOLDOWN_SECONDS', 15.0)
+        conf_high=getattr(config, 'ALERT_CONF_HIGH', 0.65),
+        conf_low=getattr(config, 'ALERT_CONF_LOW', 0.35),
+        sustained_frames=getattr(config, 'ALERT_SUSTAINED_FRAMES', 5),
+        cooldown_seconds=getattr(config, 'ALERT_COOLDOWN_SECONDS', 10.0)
     ):
         self.conf_high = conf_high
         self.conf_low = conf_low
@@ -174,7 +176,7 @@ class AlertDebouncer:
         self._in_alert_state = False
         self._last_alert_time = 0.0
 
-    def update(self, confidence):
+    def update(self, confidence: float, person_count: Optional[int] = None) -> bool:
         """
         Updates debouncer state.
         
@@ -183,24 +185,38 @@ class AlertDebouncer:
         """
         now = time.time()
 
+        # Gate: A fight requires at least 2 people
+        if person_count is not None and person_count < 2:
+            self._consecutive_high_count = 0
+            self._in_alert_state = False
+            return False
+
         if confidence >= self.conf_high:
             self._consecutive_high_count += 1
         elif confidence < self.conf_low:
-            self._consecutive_high_count = 0
+            self._consecutive_high_count = max(0, self._consecutive_high_count - 2)
             self._in_alert_state = False
 
+        # Require sustained confirmation (at least 3 frames even for extreme spikes, or sustained_frames)
+        is_high_threat = (confidence >= 0.85 and self._consecutive_high_count >= 3)
+        is_confirmed = (self._consecutive_high_count >= self.sustained_frames)
+
         # Check if condition to fire new alert is satisfied
-        if (self._consecutive_high_count >= self.sustained_frames 
-            and not self._in_alert_state 
-            and (now - self._last_alert_time) >= self.cooldown_seconds):
+        if (is_high_threat or is_confirmed) \
+            and not self._in_alert_state \
+            and (now - self._last_alert_time) >= self.cooldown_seconds:
             
             self._in_alert_state = True
             self._last_alert_time = now
             return True
 
+        # Auto-timeout alert state if confidence is no longer elevated
+        if self._in_alert_state and (now - self._last_alert_time > 6.0) and confidence < self.conf_high:
+            self._in_alert_state = False
+
         return False
 
-    def is_alarm_active(self):
+    def is_alarm_active(self) -> bool:
         """Returns True if current system state is considered under alarm condition."""
         return self._in_alert_state
 

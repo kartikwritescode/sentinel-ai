@@ -219,7 +219,7 @@ def generate_mjpeg_stream(video_source_arg: str):
     detector   = PIPELINE_MODELS["detector"] or PersonDetector()
     engineer   = FeatureEngineer()
     inferencer = PIPELINE_MODELS["inferencer"] or Tier2Inferencer()
-    debouncer  = AlertDebouncer()
+    debouncer  = AlertDebouncer(conf_high=getattr(inferencer, 'calibrated_threshold', getattr(config, 'ALERT_CONF_HIGH', 0.50)))
     logger     = PIPELINE_MODELS["logger"] or EventLogger()
     clip_writer = EvidenceClipWriter()
 
@@ -237,34 +237,43 @@ def generate_mjpeg_stream(video_source_arg: str):
             clip_writer.push_frame(frame)
 
             new_alert = False
-            if feature_vec is not None:
-                conf = inferencer.push_features(feature_vec)
-                if conf is not None:
-                    latest_confidence = conf
-                    new_alert = debouncer.update(latest_confidence)
+            if len(persons) == 0:
+                conf = 0.0
+            elif getattr(inferencer, 'model_type', '') == 'vision_bilstm':
+                conf = inferencer.push_frame(frame, persons=persons)
+            elif getattr(inferencer, 'model_type', '') == 'hybrid':
+                conf_v = inferencer.push_frame(frame, persons=persons)
+                conf_p = inferencer.push_features(feature_vec, person_count=len(persons)) if feature_vec is not None else None
+                conf = max(conf_v or 0.0, conf_p or 0.0) if (conf_v or conf_p) else None
+            else:
+                conf = inferencer.push_features(feature_vec, person_count=len(persons)) if feature_vec is not None else None
 
-                    if new_alert:
-                        clip_path = clip_writer.trigger_save()
-                        timestamp = logger.log_event(
-                            confidence=latest_confidence,
-                            clip_path=clip_path,
-                            source_id=str(source_val),
-                            person_count=len(persons)
-                        )
-                        formatted_msg = format_alert_message(
-                            timestamp=timestamp,
-                            confidence=latest_confidence,
-                            source_id=str(source_val),
-                            person_count=len(persons)
-                        )
+            if conf is not None:
+                latest_confidence = conf
+                new_alert = debouncer.update(latest_confidence, person_count=len(persons))
 
-                        def make_send_callback(msg):
-                            def _callback(saved_video_path):
-                                send_telegram_alert(message=msg, video_path=saved_video_path, async_mode=True)
-                            return _callback
+                if new_alert:
+                    clip_path = clip_writer.trigger_save()
+                    timestamp = logger.log_event(
+                        confidence=latest_confidence,
+                        clip_path=clip_path,
+                        source_id=str(source_val),
+                        person_count=len(persons)
+                    )
+                    formatted_msg = format_alert_message(
+                        timestamp=timestamp,
+                        confidence=latest_confidence,
+                        source_id=str(source_val),
+                        person_count=len(persons)
+                    )
 
-                        clip_writer.on_clip_complete = make_send_callback(formatted_msg)
-                        send_telegram_alert(message=formatted_msg, async_mode=True)
+                    def make_send_callback(msg):
+                        def _callback(saved_video_path):
+                            send_telegram_alert(message=msg, video_path=saved_video_path, async_mode=True)
+                        return _callback
+
+                    clip_writer.on_clip_complete = make_send_callback(formatted_msg)
+                    send_telegram_alert(message=formatted_msg, async_mode=True)
 
             is_alarm_active = debouncer.is_alarm_active()
 
@@ -312,7 +321,7 @@ async def upload_and_process_video(file: UploadFile = File(...)):
     detector   = PIPELINE_MODELS["detector"] or PersonDetector()
     engineer   = FeatureEngineer()
     inferencer = PIPELINE_MODELS["inferencer"] or Tier2Inferencer()
-    debouncer  = AlertDebouncer()
+    debouncer  = AlertDebouncer(conf_high=getattr(inferencer, 'calibrated_threshold', getattr(config, 'ALERT_CONF_HIGH', 0.50)))
     logger     = PIPELINE_MODELS["logger"] or EventLogger()
     clip_writer = EvidenceClipWriter()
 
@@ -330,27 +339,36 @@ async def upload_and_process_video(file: UploadFile = File(...)):
             feature_vec = engineer.update(frame, persons)
             clip_writer.push_frame(frame)
 
-            if feature_vec is not None:
-                conf = inferencer.push_features(feature_vec)
-                if conf is not None:
-                    latest_confidence = conf
-                    new_alert = debouncer.update(latest_confidence)
+            if len(persons) == 0:
+                conf = 0.0
+            elif getattr(inferencer, 'model_type', '') == 'vision_bilstm':
+                conf = inferencer.push_frame(frame, persons=persons)
+            elif getattr(inferencer, 'model_type', '') == 'hybrid':
+                conf_v = inferencer.push_frame(frame, persons=persons)
+                conf_p = inferencer.push_features(feature_vec, person_count=len(persons)) if feature_vec is not None else None
+                conf = max(conf_v or 0.0, conf_p or 0.0) if (conf_v or conf_p) else None
+            else:
+                conf = inferencer.push_features(feature_vec, person_count=len(persons)) if feature_vec is not None else None
 
-                    if new_alert:
-                        clip_path = clip_writer.trigger_save()
-                        timestamp = logger.log_event(
-                            confidence=latest_confidence,
-                            clip_path=clip_path,
-                            source_id=file.filename,
-                            person_count=len(persons)
-                        )
-                        incidents.append({
-                            "frame_index": frame_count,
-                            "timestamp": timestamp,
-                            "confidence": round(latest_confidence, 4),
-                            "evidence_clip": clip_path,
-                            "person_count": len(persons)
-                        })
+            if conf is not None:
+                latest_confidence = conf
+                new_alert = debouncer.update(latest_confidence, person_count=len(persons))
+
+                if new_alert:
+                    clip_path = clip_writer.trigger_save()
+                    timestamp = logger.log_event(
+                        confidence=latest_confidence,
+                        clip_path=clip_path,
+                        source_id=file.filename,
+                        person_count=len(persons)
+                    )
+                    incidents.append({
+                        "frame_index": frame_count,
+                        "timestamp": timestamp,
+                        "confidence": round(latest_confidence, 4),
+                        "evidence_clip": clip_path,
+                        "person_count": len(persons)
+                    })
 
     return {
         "status": "success",

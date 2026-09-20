@@ -1,97 +1,141 @@
 """
 scripts/evaluate.py
 ───────────────────
-Comprehensive Evaluation for Conv-BiGRU Temporal Attention Classifier.
+Comprehensive Model Evaluation & Benchmarking for Sentinel AI.
+
+Evaluates either:
+  - Vision-BiLSTM Model (--model-type vision_bilstm)
+  - Kinematic Pose Model (--model-type pose_gru)
+
+Reports:
+  - Accuracy, Precision, Recall (Sensitivity), Specificity, F1-Score, Macro F1, Weighted F1, False Positive Rate
+  - Confusion Matrix (TP, FP, TN, FN)
+  - Per-dataset performance breakdown (RLVS, RWF-2000, SCVD)
+  - Hardware Latency (ms/window) & Throughput (FPS)
+  - Saves full report to data/eval_report.json
 """
 
 import sys
 import os
+import argparse
+import time
+import json
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import time
-import json
-import torch
 import numpy as np
-from pathlib import Path
+import torch
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
 
 import config
-from src.classifier import SuspiciousActivityGRU, FeatureScaler, SCALER_PATH
+from src.classifier import (
+    VisionBiLSTMClassifier,
+    SuspiciousActivityClassifier,
+    FeatureScaler,
+    SCALER_PATH
+)
 from scripts.train import stratified_split
 
 
-def evaluate_model():
-    x_path   = Path("data/X_tier2.npy")
-    y_path   = Path("data/y_tier2.npy")
-    src_path = Path("data/sources.npy")
-    model_path = Path(config.TIER2_MODEL_PATH)
+def evaluate(
+    model_type: str = "vision_bilstm",
+    model_path_str: str = None,
+    dataset_filter: str = "all"
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    print(f"\n[Evaluator] Device: {device} " +
+          (f"({torch.cuda.get_device_name(0)}) | FP16 / TF32 Enabled" if device.type == 'cuda' else 'CPU'))
 
-    if not x_path.exists() or not y_path.exists():
-        print("ERROR: Feature data not found. Run scripts/extract_features.py first.")
+    # Determine paths
+    if model_type == "vision_bilstm":
+        x_path = Path("data/X_vision.npy")
+        y_path = Path("data/y_vision.npy")
+        src_path = Path("data/sources_vision.npy")
+        cid_path = Path("data/clip_ids_vision.npy")
+        default_model_path = config.VISION_MODEL_PATH
+    else:
+        x_path = Path("data/X_tier2.npy")
+        y_path = Path("data/y_tier2.npy")
+        src_path = Path("data/sources.npy")
+        cid_path = Path("data/clip_ids.npy")
+        default_model_path = config.TIER2_MODEL_PATH
+
+    m_path = Path(model_path_str if model_path_str else default_model_path)
+    if not m_path.exists():
+        print(f"ERROR: Model checkpoint not found at: {m_path}")
         return
 
-    if not model_path.exists():
-        print(f"ERROR: Model checkpoint not found at {model_path}. Run scripts/train.py first.")
+    if not x_path.exists():
+        print(f"ERROR: Feature array not found at: {x_path}")
         return
 
-    X       = np.load(x_path)
-    y       = np.load(y_path)
+    # Load data
+    X = np.load(x_path)
+    y = np.load(y_path)
     sources = np.load(src_path, allow_pickle=True) if src_path.exists() else np.array(["unknown"] * len(X))
+    cids = np.load(cid_path) if cid_path.exists() else np.arange(len(X))
 
-    # Perform stratified split (same split used in train.py)
-    _, _, X_val, y_val, X_test, y_test, src_test = stratified_split(
-        X, y, sources, train_ratio=0.80, val_ratio=0.10, seed=42
+    if dataset_filter != "all":
+        mask = np.array([dataset_filter.upper() in str(s).upper() for s in sources])
+        X = X[mask]
+        y = y[mask]
+        sources = sources[mask]
+        cids = cids[mask]
+        print(f"[Evaluator] Filtered to dataset '{dataset_filter}': {len(X)} samples.")
+
+    # Stratified test split (identical seed=42 to training)
+    _, _, X_val, y_val, X_test, y_test, src_test, cid_test = stratified_split(
+        X, y, sources, clip_ids=cids, train_ratio=0.80, val_ratio=0.10, seed=42
     )
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Evaluating on Device: {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
+    # Load Model
+    calibrated_thresh = 0.50
+    if model_type == "vision_bilstm":
+        model = VisionBiLSTMClassifier().to(device)
+        ckpt = torch.load(m_path, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+            calibrated_thresh = float(ckpt.get('calibrated_threshold', 0.50))
+        else:
+            model.load_state_dict(ckpt)
+    else:
+        scaler = FeatureScaler()
+        if os.path.exists(SCALER_PATH):
+            scaler.load(SCALER_PATH)
+        else:
+            scaler.fit(X)
+        X_test = scaler.transform(X_test)
+        model = SuspiciousActivityClassifier().to(device)
+        model.load_state_dict(torch.load(m_path, map_location=device, weights_only=False))
 
-    # Load FeatureScaler
-    scaler = FeatureScaler()
-    if not scaler.load(SCALER_PATH):
-        scaler.fit(X)
-
-    X_val_norm  = scaler.transform(X_val)
-    X_test_norm = scaler.transform(X_test)
-
-    # Load model
-    model = SuspiciousActivityGRU().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
+    print(f"[Evaluator] Loaded checkpoint: {m_path.name} (Calibrated Threshold: {calibrated_thresh:.2f})")
 
-    # Latency benchmark
-    X_t = torch.FloatTensor(X_test_norm).to(device)
+    # Latency & Throughput Benchmark
+    X_t = torch.FloatTensor(X_test).to(device)
     with torch.no_grad():
-        _ = model(X_t[:10])  # Warmup
+        # Warmup
+        _ = model(X_t[:min(10, len(X_t))])
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+
         t0 = time.time()
-        logits = model(X_t).squeeze(1)
-        probs = logits.cpu().numpy()
-        total_time = time.time() - t0
+        probs = model(X_t).squeeze(1).cpu().numpy()
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        total_eval_time = time.time() - t0
 
-    latency_ms = (total_time / len(X_test)) * 1000.0
-    throughput_fps = len(X_test) / total_time
+    latency_ms = (total_eval_time / len(X_test)) * 1000.0
+    throughput_fps = len(X_test) / total_eval_time if total_eval_time > 0 else 0.0
 
-    # Find optimal threshold on validation set
-    with torch.no_grad():
-        val_probs = model(torch.FloatTensor(X_val_norm).to(device)).squeeze(1).cpu().numpy()
-
-    best_thresh = 0.50
-    best_f1 = 0.0
-    for t in np.linspace(0.35, 0.65, 31):
-        v_pred = (val_probs >= t).astype(int)
-        tp = np.sum((v_pred == 1) & (y_val == 1))
-        fp = np.sum((v_pred == 1) & (y_val == 0))
-        fn = np.sum((v_pred == 0) & (y_val == 1))
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
-        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thresh = float(t)
-
-    # Predictions on test set using optimal threshold
-    preds = (probs >= best_thresh).astype(int)
+    # Predictions
+    preds = (probs >= calibrated_thresh).astype(int)
     targets = y_test.astype(int)
 
     tp = int(np.sum((preds == 1) & (targets == 1)))
@@ -100,87 +144,102 @@ def evaluate_model():
     fn = int(np.sum((preds == 0) & (targets == 1)))
 
     total = len(targets)
-    accuracy    = (tp + tn) / total if total > 0 else 0.0
-    precision   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall      = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    f1_score    = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-    fpr         = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    acc = (tp + tn) / total * 100.0 if total > 0 else 0.0
+    prec = tp / (tp + fp) * 100.0 if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) * 100.0 if (tp + fn) > 0 else 0.0
+    spec = tn / (tn + fp) * 100.0 if (tn + fp) > 0 else 0.0
+    f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+    macro_f1 = f1_score(targets, preds, average="macro") * 100.0
+    weighted_f1 = f1_score(targets, preds, average="weighted") * 100.0
+    fpr = fp / (fp + tn) * 100.0 if (fp + tn) > 0 else 0.0
 
-    # Per-dataset breakdown
+    print(f"\n{'='*65}")
+    print(f"  MODEL EVALUATION REPORT: {model_type.upper()}")
+    print(f"{'='*65}")
+    print(f" Checkpoint          : {m_path.resolve()}")
+    print(f" Calibrated Threshold: {calibrated_thresh:.2f}")
+    print(f" Test Set Samples    : {total}")
+    print(f" -------------------------------------------------------------")
+    print(f" Accuracy            : {acc:.2f}%")
+    print(f" Macro F1-Score      : {macro_f1:.2f}%")
+    print(f" Weighted F1-Score   : {weighted_f1:.2f}%")
+    print(f" Precision           : {prec:.2f}%")
+    print(f" Recall (Sensitivity): {rec:.2f}%")
+    print(f" Specificity         : {spec:.2f}%")
+    print(f" False Positive Rate : {fpr:.2f}%")
+    print(f" -------------------------------------------------------------")
+    print(f" CONFUSION MATRIX:")
+    print(f"   TP (Fight as Fight)       : {tp:>5}")
+    print(f"   FP (NonFight as Fight)    : {fp:>5}")
+    print(f"   TN (NonFight as NonFight) : {tn:>5}")
+    print(f"   FN (Fight as NonFight)    : {fn:>5}")
+    print(f" -------------------------------------------------------------")
+    print(f" PER-DATASET PERFORMANCE:")
     dataset_metrics = {}
     for src in sorted(set(src_test)):
         mask = (src_test == src)
-        sub_preds = preds[mask]
-        sub_targets = targets[mask]
-        sub_correct = np.sum(sub_preds == sub_targets)
-        sub_total = len(sub_targets)
+        sub_correct = np.sum(preds[mask] == targets[mask])
+        sub_total = np.sum(mask)
         sub_acc = sub_correct / sub_total * 100.0 if sub_total > 0 else 0.0
+        sub_f1 = f1_score(targets[mask], preds[mask], average="macro", zero_division=0) * 100.0
+        print(f"   {str(src):<14} : {sub_acc:6.2f}% (Acc) | {sub_f1:6.2f}% (Macro F1) | {sub_correct}/{sub_total} clips")
         dataset_metrics[str(src)] = {
-            "total_samples": int(sub_total),
+            "total": int(sub_total),
             "correct": int(sub_correct),
-            "accuracy_pct": round(sub_acc, 2)
+            "accuracy_pct": round(sub_acc, 2),
+            "macro_f1_pct": round(sub_f1, 2)
         }
+    print(f" -------------------------------------------------------------")
+    print(f" Hardware Latency    : {latency_ms:.3f} ms per window")
+    print(f" Throughput          : {throughput_fps:,.1f} FPS")
+    print(f"{'='*65}")
 
-    metrics_report = {
+    report = {
+        "model_type": model_type,
+        "checkpoint": str(m_path.resolve()),
         "device": str(device),
         "test_samples": total,
-        "calibrated_threshold": round(best_thresh, 2),
-        "confusion_matrix": {
-            "true_positives": tp,
-            "false_positives": fp,
-            "true_negatives": tn,
-            "false_negatives": fn
-        },
+        "calibrated_threshold": round(calibrated_thresh, 2),
         "metrics": {
-            "accuracy_pct": round(accuracy * 100.0, 2),
-            "precision_pct": round(precision * 100.0, 2),
-            "recall_sensitivity_pct": round(recall * 100.0, 2),
-            "specificity_pct": round(specificity * 100.0, 2),
-            "f1_score_pct": round(f1_score * 100.0, 2),
-            "false_positive_rate_pct": round(fpr * 100.0, 2)
+            "accuracy_pct": round(acc, 2),
+            "macro_f1_pct": round(macro_f1, 2),
+            "weighted_f1_pct": round(weighted_f1, 2),
+            "precision_pct": round(prec, 2),
+            "recall_pct": round(rec, 2),
+            "specificity_pct": round(spec, 2),
+            "false_positive_rate_pct": round(fpr, 2)
         },
+        "confusion_matrix": {
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn
+        },
+        "per_dataset": dataset_metrics,
         "latency": {
-            "avg_inference_ms": round(latency_ms, 3),
+            "avg_latency_ms": round(latency_ms, 3),
             "throughput_fps": round(throughput_fps, 1)
-        },
-        "per_dataset_accuracy": dataset_metrics
+        }
     }
 
     report_path = Path("data/eval_report.json")
-    report_path.parent.mkdir(exist_ok=True)
     with open(report_path, "w") as f:
-        json.dump(metrics_report, f, indent=4)
+        json.dump(report, f, indent=4)
+    print(f"Saved full JSON evaluation report to: {report_path.resolve()}\n")
+    return report
 
-    print("\n=======================================================")
-    print("      CONV-BIGRU ATTENTION MODEL EVALUATION REPORT     ")
-    print("=======================================================")
-    print(f" Calibrated Threshold: {best_thresh:.2f}")
-    print(f" Test Set Size       : {total} clips")
-    print(" -------------------------------------------------------")
-    print(f" Accuracy            : {accuracy * 100.0:.2f}%")
-    print(f" Precision           : {precision * 100.0:.2f}%")
-    print(f" Recall (Sensitivity): {recall * 100.0:.2f}%")
-    print(f" Specificity         : {specificity * 100.0:.2f}%")
-    print(f" F1-Score            : {f1_score * 100.0:.2f}%")
-    print(f" False Positive Rate : {fpr * 100.0:.2f}%")
-    print(" -------------------------------------------------------")
-    print(" CONFUSION MATRIX:")
-    print(f"   TP (Fight detected as Fight)      : {tp:>4}")
-    print(f"   FP (NonFight detected as Fight)   : {fp:>4}")
-    print(f"   TN (NonFight detected as NonFight): {tn:>4}")
-    print(f"   FN (Fight detected as NonFight)   : {fn:>4}")
-    print(" -------------------------------------------------------")
-    print(" PER-DATASET ACCURACY:")
-    for src, d in dataset_metrics.items():
-        print(f"   {src:<14} : {d['accuracy_pct']:.2f}% ({d['correct']}/{d['total_samples']})")
-    print(" -------------------------------------------------------")
-    print(f" Avg Latency per Window : {latency_ms:.3f} ms")
-    print(f" Throughput             : {throughput_fps:.1f} FPS")
-    print("=======================================================")
-    print(f"Saved full JSON report to: {report_path.resolve()}\n")
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate Sentinel AI Model Checkpoint")
+    parser.add_argument("--model-type", type=str, default="vision_bilstm",
+                        choices=["vision_bilstm", "pose_gru"],
+                        help="Model architecture type: 'vision_bilstm' or 'pose_gru'")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="Path to trained checkpoint (.pt)")
+    parser.add_argument("--dataset", type=str, default="all",
+                        choices=["all", "scvd", "rlvs", "rwf"],
+                        help="Evaluate on subset or 'all'")
+    args = parser.parse_args()
+
+    evaluate(model_type=args.model_type, model_path_str=args.model_path, dataset_filter=args.dataset)
 
 
 if __name__ == "__main__":
-    evaluate_model()
-
+    main()
