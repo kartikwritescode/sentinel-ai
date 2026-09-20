@@ -120,16 +120,20 @@ def evaluate(
     # Latency & Throughput Benchmark
     X_t = torch.FloatTensor(X_test).to(device)
     with torch.no_grad():
-        # Warmup
-        _ = model(X_t[:min(10, len(X_t))])
+        # Warmup GPU kernels and allocate tensors
+        for _ in range(3):
+            _ = model(X_t)
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
+        n_runs = 10
         t0 = time.time()
-        probs = model(X_t).squeeze(1).cpu().numpy()
+        for _ in range(n_runs):
+            probs_tensor = model(X_t)
         if device.type == 'cuda':
             torch.cuda.synchronize()
-        total_eval_time = time.time() - t0
+        total_eval_time = (time.time() - t0) / n_runs
+        probs = probs_tensor.squeeze(1).cpu().numpy()
 
     latency_ms = (total_eval_time / len(X_test)) * 1000.0
     throughput_fps = len(X_test) / total_eval_time if total_eval_time > 0 else 0.0

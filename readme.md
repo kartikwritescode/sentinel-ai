@@ -31,24 +31,24 @@ Evaluated on a held-out test split of **667 unseen video clips** across all thre
 
 | Metric | Benchmark Result | Description |
 |---|---|---|
-| **Overall Accuracy** | **86.36%** | Correct predictions across all 667 test clips |
-| **Recall / Sensitivity** | **90.26%** | High fight detection rate (detects 9 out of 10 violent events) |
-| **Precision** | **86.40%** | Reliability of positive alert triggers |
-| **Macro F1-Score** | **85.98%** | Balanced unweighted harmonic mean across classes |
-| **Weighted F1-Score** | **86.30%** | Sample-weighted harmonic mean |
-| **Specificity** | **81.18%** | True Negative Rate (normal activity correctly recognized) |
-| **False Positive Rate (FPR)** | **18.82%** | Significantly suppressed via motion delta & person gating |
-| **Calibrated Threshold** | **0.52** | Optimal validation-calibrated operating point |
-| **Model Inference Latency** | **0.029 ms / window** | Measured on NVIDIA GeForce RTX 4060 Laptop GPU |
-| **Model Throughput** | **34,063 FPS** | Raw batch inference throughput |
+| **Overall Accuracy** | **91.15%** | Correct predictions across all 667 test clips (608/667 correct) |
+| **Recall / Sensitivity** | **96.58%** | Critical surveillance safety rate (catches 367 out of 380 violent events) |
+| **Precision** | **88.86%** | Reliability of positive alert triggers |
+| **Macro F1-Score** | **90.83%** | Balanced unweighted harmonic mean across classes |
+| **Weighted F1-Score** | **91.07%** | Sample-weighted harmonic mean |
+| **Specificity** | **83.97%** | True Negative Rate (normal activity correctly recognized) |
+| **False Positive Rate (FPR)** | **16.03%** | Suppressed via multi-stride delta, MS-TCN, and person gating |
+| **Calibrated Threshold** | **0.43** | Optimal validation-calibrated operating point |
+| **Model Inference Latency** | **0.114 ms / window** | Measured on NVIDIA GeForce RTX 4060 Laptop GPU |
+| **Model Throughput** | **8,807 FPS** | Raw batch inference throughput |
 | **Real-Time Surveillance FPS** | **81.3 FPS** | End-to-end pipeline (Capture + Pose + Tracking + Vision + Display) |
 
 ### 🎯 Confusion Matrix (667 Test Clips)
 
 | | Predicted NonFight | Predicted Fight |
 |---|---|---|
-| **Actual NonFight (380 clips)** | **TN = 233** | FP = 54 |
-| **Actual Fight (287 clips)** | FN = 37 | **TP = 343** |
+| **Actual NonFight (287 clips)** | **TN = 241** | FP = 46 |
+| **Actual Fight (380 clips)** | FN = 13 | **TP = 367** |
 
 ---
 
@@ -58,10 +58,10 @@ The model is trained across all **6,648 clips** from diverse environments (schoo
 
 | Dataset Scope | Test Samples | Accuracy | Macro F1 | Correct / Total |
 |---|---|---|---|---|
-| **RLVS** (Real Life Violence Situations) | 173 clips | **94.22%** | **94.21%** | 163 / 173 clips |
-| **SCVD** (Smart City Violence Dataset) | 276 clips | **93.48%** | **92.54%** | 258 / 276 clips |
-| **RWF-2000** (Real-World Surveillance CCTV) | 218 clips | **71.10%** | **70.88%** | 155 / 218 clips |
-| **Overall Combined** | **667 clips** | **86.36%** | **85.98%** | **576 / 667 clips** |
+| **RLVS** (Real Life Violence Situations) | 173 clips | **96.53%** | **96.53%** | 167 / 173 clips |
+| **SCVD** (Smart City Violence Dataset) | 276 clips | **98.19%** | **97.88%** | 271 / 276 clips |
+| **RWF-2000** (Real-World Surveillance CCTV) | 218 clips | **77.98%** | **77.66%** | 170 / 218 clips |
+| **Overall Combined** | **667 clips** | **91.15%** | **90.83%** | **608 / 667 clips** |
 
 ---
 
